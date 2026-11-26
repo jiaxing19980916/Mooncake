@@ -210,6 +210,10 @@ class ShardAllocator final : public DfsAllocatorInterface {
                             const std::string& field,
                             const std::string& value);
     bool RedisRemoveAlloc(int shard_idx, uint64_t alloc_offset);
+    // Stamp the leader epoch into every shard hash before restoring/serving.
+    bool StampShardEpochs();
+    // Stamp a range of shard hashes (new shards after expansion).
+    bool StampShardEpochRange(int begin, int end);
     // Rebuild every shard's allocator + offset_to_handle from Redis. Called
     // once from Init(); corrupt/overlapping data aborts startup.
     tl::expected<void, ErrorCode> RestoreFromRedis();
@@ -264,6 +268,7 @@ class ShardAllocator final : public DfsAllocatorInterface {
         ha::common::redis::RedisContextPtr ctx;
     };
     std::vector<std::unique_ptr<RedisConn>> redis_conns_;
+    uint64_t redis_fence_epoch_ = 0;
 #ifdef STORE_USE_REDIS
     RedisConn& RedisConnForShard(int shard_idx) {
         return *redis_conns_[static_cast<size_t>(shard_idx) %

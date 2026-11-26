@@ -1,5 +1,6 @@
 #include "ha/kv/master_meta_redis_store.h"
 
+#include "ha/common/redis/redis_fence.h"
 
 #include <algorithm>
 #include <atomic>
@@ -177,6 +178,99 @@ std::string MasterMetaRedisStore::SegHashKey() const {
     return prefix + "seg";
 }
 
+std::string MasterMetaRedisStore::EpochKey() const {
+    const std::string prefix =
+        config_.ns.empty() ? std::string() : config_.ns + ":";
+    return prefix + "epoch";
+}
+
+#ifdef STORE_USE_REDIS
+namespace {
+// Stamp one epoch into a list of hashes in bounded pipelines.
+bool StampHashes(redisContext* ctx, const std::vector<std::string>& hashes,
+                 const std::string& epoch, const char* what) {
+    constexpr size_t kChunk = 128;
+    for (size_t off = 0; off < hashes.size(); off += kChunk) {
+        const size_t n = std::min(kChunk, hashes.size() - off);
+        size_t appended = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const std::string& hash_key = hashes[off + i];
+            static const char kEval[] = "EVAL";
+            static const char kOne[] = "1";
+            std::vector<const char*> argv = {
+                kEval, ha::common::redis::kStampEpochScript, kOne,
+                hash_key.data(), epoch.data()};
+            std::vector<size_t> argvlen = {
+                sizeof(kEval) - 1,
+                std::strlen(ha::common::redis::kStampEpochScript),
+                sizeof(kOne) - 1, hash_key.size(), epoch.size()};
+            if (redisAppendCommandArgv(ctx, static_cast<int>(argv.size()),
+                                       argv.data(), argvlen.data()) !=
+                REDIS_OK) {
+                LOG(ERROR) << "MetaRedis epoch stamp append failed, key="
+                           << hash_key;
+                return false;
+            }
+            ++appended;
+        }
+        for (size_t i = 0; i < appended; ++i) {
+            redisReply* reply = nullptr;
+            if (redisGetReply(ctx, reinterpret_cast<void**>(&reply)) !=
+                    REDIS_OK ||
+                reply == nullptr || reply->type != REDIS_REPLY_INTEGER) {
+                if (reply != nullptr) freeReplyObject(reply);
+                LOG(ERROR) << "MetaRedis epoch stamp failed for " << what;
+                return false;
+            }
+            freeReplyObject(reply);
+        }
+    }
+    return true;
+}
+}  // namespace
+#endif
+
+bool MasterMetaRedisStore::StartLeaderEpoch() {
+    if (!Enabled()) return true;
+#ifndef STORE_USE_REDIS
+    LOG(ERROR) << "MetaRedis leader epoch requested but the build lacks "
+                  "STORE_USE_REDIS";
+    return false;
+#else
+    auto conn = ha::common::redis::ConnectRedis(config_.connstring);
+    if (!conn) {
+        LOG(ERROR) << "MetaRedis epoch claim: connect failed";
+        return false;
+    }
+    redisContext* ctx = conn.value().get();
+    ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
+        redisCommand(ctx, "INCR %s", EpochKey().c_str())));
+    if (reply == nullptr || reply->type != REDIS_REPLY_INTEGER ||
+        reply->integer <= 0) {
+        LOG(ERROR) << "MetaRedis epoch claim: INCR failed, key="
+                   << EpochKey();
+        return false;
+    }
+    fence_epoch_ = static_cast<uint64_t>(reply->integer);
+    fence_lost_.store(false, std::memory_order_relaxed);
+
+    // Stamp every hash this store can write. A stale leader's per-key EVAL
+    // compares against this field, so a hash without the stamp fails closed.
+    std::vector<std::string> hashes;
+    hashes.reserve(config_.num_buckets + 1);
+    for (size_t b = 0; b < config_.num_buckets; ++b) {
+        hashes.push_back(ObjHashKey(b));
+    }
+    hashes.push_back(SegHashKey());
+    const std::string epoch = std::to_string(fence_epoch_);
+    if (!StampHashes(ctx, hashes, epoch, "object/segment hashes")) {
+        return false;
+    }
+    LOG(INFO) << "MetaRedis leader epoch claimed: " << fence_epoch_;
+    return true;
+#endif
+}
+
 int MasterMetaRedisStore::ParseBucketFromHashKey(
     std::string_view hash_key) const {
     const std::string prefix = ObjHashPrefix();
@@ -217,6 +311,24 @@ bool MasterMetaRedisStore::HSet(ConnSlot& slot, std::string_view hash_key,
                                 std::string_view field,
                                 std::string_view value) {
     if (!EnsureConnectedLocked(slot)) return false;
+    if (fence_epoch_ != 0) {
+        const std::string epoch = std::to_string(fence_epoch_);
+        ha::common::redis::RedisReplyPtr reply(ha::common::redis::EvalScript(
+            slot.ctx.get(), ha::common::redis::kFencedHSetScript, hash_key,
+            {epoch, field, value}));
+        if (ha::common::redis::IsFenceMismatch(reply.get())) {
+            fence_lost_.store(true, std::memory_order_relaxed);
+            LOG(ERROR) << "MetaRedis leader fence lost (HSET), key=" << hash_key;
+            return false;
+        }
+        if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "MetaRedis fenced HSET failed, key=" << hash_key
+                       << ", dropping connection for reconnect";
+            slot.ctx.reset();
+            return false;
+        }
+        return ha::common::redis::IsFenceMatch(reply.get());
+    }
     ha::common::redis::RedisReplyPtr reply(
         static_cast<redisReply*>(redisCommand(
             slot.ctx.get(), "HSET %b %b %b", hash_key.data(),
@@ -251,21 +363,41 @@ bool MasterMetaRedisStore::DoDelObjects(
         config_.hdel_chunk_fields > 0 ? config_.hdel_chunk_fields : 1;
     for (size_t off = 0; off < fields.size(); off += max_fields_per_cmd) {
         const size_t n = std::min(max_fields_per_cmd, fields.size() - off);
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(n + 2);
-        argvlen.reserve(n + 2);
-        argv.push_back("HDEL");
-        argvlen.push_back(4);
-        argv.push_back(hash_key.data());
-        argvlen.push_back(hash_key.size());
-        for (size_t i = 0; i < n; ++i) {
-            argv.push_back(fields[off + i].data());
-            argvlen.push_back(fields[off + i].size());
+        ha::common::redis::RedisReplyPtr reply;
+        if (fence_epoch_ != 0) {
+            const std::string epoch = std::to_string(fence_epoch_);
+            std::vector<std::string_view> args;
+            args.reserve(n + 1);
+            args.push_back(epoch);
+            for (size_t i = 0; i < n; ++i) {
+                args.push_back(fields[off + i]);
+            }
+            reply.reset(ha::common::redis::EvalScript(
+                slot.ctx.get(), ha::common::redis::kFencedBatchHDelScript,
+                hash_key, args));
+            if (ha::common::redis::IsFenceMismatch(reply.get())) {
+                fence_lost_.store(true, std::memory_order_relaxed);
+                LOG(ERROR) << "MetaRedis leader fence lost (batch HDEL), key="
+                           << hash_key;
+                return false;
+            }
+        } else {
+            std::vector<const char*> argv;
+            std::vector<size_t> argvlen;
+            argv.reserve(n + 2);
+            argvlen.reserve(n + 2);
+            argv.push_back("HDEL");
+            argvlen.push_back(4);
+            argv.push_back(hash_key.data());
+            argvlen.push_back(hash_key.size());
+            for (size_t i = 0; i < n; ++i) {
+                argv.push_back(fields[off + i].data());
+                argvlen.push_back(fields[off + i].size());
+            }
+            reply.reset(static_cast<redisReply*>(
+                redisCommandArgv(slot.ctx.get(), static_cast<int>(argv.size()),
+                                 argv.data(), argvlen.data())));
         }
-        ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
-            redisCommandArgv(slot.ctx.get(), static_cast<int>(argv.size()),
-                             argv.data(), argvlen.data())));
         if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "MetaRedis batch HDEL failed, key=" << hash_key
                        << ", fields=" << n
@@ -303,24 +435,45 @@ bool MasterMetaRedisStore::DoPutObjects(
         config_.hdel_chunk_fields > 0 ? config_.hdel_chunk_fields : 1;
     for (size_t off = 0; off < field_values.size(); off += max_fields_per_cmd) {
         const size_t n = std::min(max_fields_per_cmd, field_values.size() - off);
-        std::vector<const char*> argv;
-        std::vector<size_t> argvlen;
-        argv.reserve(2 * n + 2);
-        argvlen.reserve(2 * n + 2);
-        argv.push_back("HSET");
-        argvlen.push_back(4);
-        argv.push_back(hash_key.data());
-        argvlen.push_back(hash_key.size());
-        for (size_t i = 0; i < n; ++i) {
-            const auto& [field, value] = field_values[off + i];
-            argv.push_back(field.data());
-            argvlen.push_back(field.size());
-            argv.push_back(value.data());
-            argvlen.push_back(value.size());
+        ha::common::redis::RedisReplyPtr reply;
+        if (fence_epoch_ != 0) {
+            const std::string epoch = std::to_string(fence_epoch_);
+            std::vector<std::string_view> args;
+            args.reserve(2 * n + 1);
+            args.push_back(epoch);
+            for (size_t i = 0; i < n; ++i) {
+                args.push_back(field_values[off + i].first);
+                args.push_back(field_values[off + i].second);
+            }
+            reply.reset(ha::common::redis::EvalScript(
+                slot.ctx.get(), ha::common::redis::kFencedBatchHSetScript,
+                hash_key, args));
+            if (ha::common::redis::IsFenceMismatch(reply.get())) {
+                fence_lost_.store(true, std::memory_order_relaxed);
+                LOG(ERROR) << "MetaRedis leader fence lost (batch HSET), key="
+                           << hash_key;
+                return false;
+            }
+        } else {
+            std::vector<const char*> argv;
+            std::vector<size_t> argvlen;
+            argv.reserve(2 * n + 2);
+            argvlen.reserve(2 * n + 2);
+            argv.push_back("HSET");
+            argvlen.push_back(4);
+            argv.push_back(hash_key.data());
+            argvlen.push_back(hash_key.size());
+            for (size_t i = 0; i < n; ++i) {
+                const auto& [field, value] = field_values[off + i];
+                argv.push_back(field.data());
+                argvlen.push_back(field.size());
+                argv.push_back(value.data());
+                argvlen.push_back(value.size());
+            }
+            reply.reset(static_cast<redisReply*>(
+                redisCommandArgv(slot.ctx.get(), static_cast<int>(argv.size()),
+                                 argv.data(), argvlen.data())));
         }
-        ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
-            redisCommandArgv(slot.ctx.get(), static_cast<int>(argv.size()),
-                             argv.data(), argvlen.data())));
         if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "MetaRedis batch HSET failed, key=" << hash_key
                        << ", fields=" << n
@@ -357,44 +510,90 @@ bool MasterMetaRedisStore::DoPutObjectAndHashes(
     if (!EnsureConnectedLocked(slot)) return false;
     const std::string hash_key = ObjHashKey(bucket);
     const std::string field = EncodeField(tenant_id, key);
-    // Ledger first, object last: a pipeline that dies midway leaves at most
-    // orphan oth records, never an object whose extents are missing.
+    const std::string epoch = std::to_string(fence_epoch_);
+    // Pipeline only no multi key EVAL, obj oth may hit different slots CROSSSLOT.
+    // When the leader fence is on, each command is a single-key EVAL against
+    // its own hash; the whole batch is still one network round trip.
+    // Ledger first, object last, a pipeline that dies mid way then leaves at most orphan oth
+    // records safe, reclaimed later, never an object whose extents are missing from the ledger.
+    auto append_write = [&](std::string_view hk, std::string_view f,
+                            std::string_view v) -> bool {
+        if (fence_epoch_ == 0) {
+            return redisAppendCommand(slot.ctx.get(), "HSET %b %b %b",
+                                      hk.data(), hk.size(), f.data(), f.size(),
+                                      v.data(), v.size()) == REDIS_OK;
+        }
+        static const char kEval[] = "EVAL";
+        static const char kOne[] = "1";
+        std::vector<const char*> argv = {kEval,
+                                         ha::common::redis::kFencedHSetScript,
+                                         kOne,
+                                         hk.data(),
+                                         epoch.data(),
+                                         f.data(),
+                                         v.data()};
+        std::vector<size_t> argvlen = {
+            sizeof(kEval) - 1,
+            std::strlen(ha::common::redis::kFencedHSetScript),
+            sizeof(kOne) - 1,
+            hk.size(),
+            epoch.size(),
+            f.size(),
+            v.size()};
+        return redisAppendCommandArgv(slot.ctx.get(),
+                                      static_cast<int>(argv.size()),
+                                      argv.data(), argvlen.data()) == REDIS_OK;
+    };
+
     size_t appended = 0;
     bool ok = true;
     for (const auto& cmd : extra) {
-        if (redisAppendCommand(slot.ctx.get(), "HSET %b %b %b",
-                               cmd.hash_key.data(), cmd.hash_key.size(),
-                               cmd.field.data(), cmd.field.size(),
-                               cmd.value.data(), cmd.value.size()) != REDIS_OK) {
+        if (!append_write(cmd.hash_key, cmd.field, cmd.value)) {
             ok = false;
             break;
         }
         ++appended;
     }
     if (ok) {
-        if (redisAppendCommand(slot.ctx.get(), "HSET %b %b %b",
-                               hash_key.data(), hash_key.size(),
-                               field.data(), field.size(), payload.data(),
-                               payload.size()) == REDIS_OK) {
+        // binary form everywhere, EncodeField is binary safe, string form would truncate the field at a NUL.
+        if (append_write(hash_key, field, payload)) {
             ++appended;
         } else {
             ok = false;
         }
     }
+    bool fence_rejected = false;
     for (size_t i = 0; i < appended; ++i) {
         redisReply* reply = nullptr;
         if (redisGetReply(slot.ctx.get(), reinterpret_cast<void**>(&reply)) !=
                 REDIS_OK ||
-            reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+            reply == nullptr) {
+            ok = false;
+            break;
+        }
+        if (fence_epoch_ != 0) {
+            if (reply->type == REDIS_REPLY_INTEGER && reply->integer == 0) {
+                fence_rejected = true;
+                ok = false;
+            } else if (reply->type != REDIS_REPLY_INTEGER) {
+                ok = false;
+            }
+        } else if (reply->type == REDIS_REPLY_ERROR) {
             ok = false;
         }
-        if (reply != nullptr) freeReplyObject(reply);
+        freeReplyObject(reply);
     }
     if (!ok) {
-        LOG(ERROR) << "MetaRedis pipelined HSET failed, key=" << hash_key
-                   << ", extra=" << extra.size()
-                   << ", dropping connection for reconnect";
-        slot.ctx.reset();
+        if (fence_rejected) {
+            fence_lost_.store(true, std::memory_order_relaxed);
+            LOG(ERROR) << "MetaRedis leader fence lost (pipeline HSET), key="
+                       << hash_key;
+        } else {
+            LOG(ERROR) << "MetaRedis pipelined HSET failed, key=" << hash_key
+                       << ", extra=" << extra.size()
+                       << ", dropping connection for reconnect";
+            slot.ctx.reset();
+        }
     }
     return ok;
 }
@@ -402,6 +601,24 @@ bool MasterMetaRedisStore::DoPutObjectAndHashes(
 bool MasterMetaRedisStore::HDel(ConnSlot& slot, std::string_view hash_key,
                                 std::string_view field) {
     if (!EnsureConnectedLocked(slot)) return false;
+    if (fence_epoch_ != 0) {
+        const std::string epoch = std::to_string(fence_epoch_);
+        ha::common::redis::RedisReplyPtr reply(ha::common::redis::EvalScript(
+            slot.ctx.get(), ha::common::redis::kFencedHDelScript, hash_key,
+            {epoch, field}));
+        if (ha::common::redis::IsFenceMismatch(reply.get())) {
+            fence_lost_.store(true, std::memory_order_relaxed);
+            LOG(ERROR) << "MetaRedis leader fence lost (HDEL), key=" << hash_key;
+            return false;
+        }
+        if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "MetaRedis fenced HDEL failed, key=" << hash_key
+                       << ", dropping connection for reconnect";
+            slot.ctx.reset();
+            return false;
+        }
+        return ha::common::redis::IsFenceMatch(reply.get());
+    }
     ha::common::redis::RedisReplyPtr reply(
         static_cast<redisReply*>(redisCommand(slot.ctx.get(), "HDEL %b %b",
                                               hash_key.data(), hash_key.size(),
@@ -467,7 +684,6 @@ bool MasterMetaRedisStore::DelSegment(std::string_view transport_endpoint) {
                             ConnSlot& s) { return HDel(s, hash_key, field); });
 }
 
-
 // ---- read side (leader promotion) ------------------------------------------
 
 tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
@@ -508,6 +724,10 @@ MasterMetaRedisStore::RecoverSegments() {
     for (size_t i = 0; i + 1 < reply->elements; i += 2) {
         redisReply* f = reply->element[i];
         redisReply* v = reply->element[i + 1];
+        if (std::string_view(f->str, f->len) ==
+            ha::common::redis::kFenceField) {
+            continue;
+        }
         StandbySegmentInfo seg;
         if (struct_pack::deserialize_to(
                 seg, std::string_view(v->str, v->len)) !=
@@ -543,6 +763,9 @@ tl::expected<uint64_t, ErrorCode> MasterMetaRedisStore::RecoverOneObjectHash(
             redisReply* f = kv->element[i];
             redisReply* v = kv->element[i + 1];
             std::string_view field(f->str, f->len);
+            if (field == ha::common::redis::kFenceField) {
+                continue;
+            }
             std::string tenant_id;
             std::string key;
             if (!DecodeField(field, tenant_id, key)) {
@@ -661,7 +884,8 @@ MasterMetaRedisStore::RecoverObjectsConcurrent(int num_pshards) {
 #else  // STORE_USE_REDIS
 
 // Stubs for builds without hiredis. Writes are no-ops that report success so
-// the master runs normally.
+// the master runs normally; recovery reads only succeed when Redis recovery is
+// disabled, otherwise they surface PERSISTENT_FAIL (misconfiguration).
 
 bool MasterMetaRedisStore::PutObject(size_t, std::string_view, std::string_view,
                                      std::string_view) {

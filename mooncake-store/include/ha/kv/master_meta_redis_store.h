@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -85,6 +86,16 @@ class MasterMetaRedisStore {
     // failure, so unmount can retry while the segment is still in memory.
     bool DelSegment(std::string_view transport_endpoint);
 
+    // Claim a new leader epoch (`INCR <ns>:epoch`) and stamp it into every
+    // object bucket, the segment hash, and (via the allocator) every oth shard
+    // hash. Must succeed before the master serves; afterwards a stale leader's
+    // writes are rejected by the per-hash fence.
+    bool StartLeaderEpoch();
+    uint64_t Epoch() const { return fence_epoch_; }
+    bool FenceLost() const {
+        return fence_lost_.load(std::memory_order_relaxed);
+    }
+
     // ---- read side (leader promotion) ----
     tl::expected<std::vector<StandbyObjectEntry>, ErrorCode> RecoverObjects();
     tl::expected<std::vector<StandbySegmentInfo>, ErrorCode> RecoverSegments();
@@ -103,6 +114,7 @@ class MasterMetaRedisStore {
 
    private:
     static std::string FormatBucket(size_t bucket, size_t num_buckets);
+    std::string EpochKey() const;  // "<ns>:epoch"
 
     // Per-slot actor: one dedicated I/O thread owns one hiredis context. Callers
     // enqueue a job and wait on its promise, so the queue mutex never covers a
@@ -156,6 +168,10 @@ class MasterMetaRedisStore {
 
     Config config_;
     std::vector<std::unique_ptr<ConnSlot>> conns_;
+    // Set once by StartLeaderEpoch() before serving; actor threads read it
+    // afterwards without further synchronization.
+    uint64_t fence_epoch_ = 0;
+    std::atomic<bool> fence_lost_{false};
 };
 
 }  // namespace mooncake

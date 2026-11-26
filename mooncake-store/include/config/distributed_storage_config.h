@@ -31,6 +31,9 @@ struct DistributedStorageConfig {
     std::string redis_namespace;
     int redis_pscan_shards = 0;
     int redis_write_conns = 0;
+    // Leader epoch stamped into every shard hash. Non-zero turns on the
+    // per-hash fence that rejects writes from a stale leader.
+    uint64_t redis_fence_epoch = 0;
 
     bool UsesObjectStorage() const {
         return fs_adapter_type == "oss" || fs_adapter_type == "s3" ||

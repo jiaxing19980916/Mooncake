@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "config/distributed_storage_config.h"
+#include "ha/common/redis/redis_fence.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #ifdef STORE_USE_REDIS
@@ -90,6 +91,7 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
     redis_enabled_ = !redis_connstring_.empty();
     redis_pscan_shards_ = config.redis_pscan_shards;
     redis_write_conns_ = config.redis_write_conns;
+    redis_fence_epoch_ = config.redis_fence_epoch;
     const size_t redis_conn_count =
         redis_write_conns_ > 0 ? static_cast<size_t>(redis_write_conns_) : 1;
     redis_conns_.clear();
@@ -205,6 +207,10 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
     // Redis is the cross-failover truth for extents. Restore before serving;
     // corrupt/overlapping data aborts startup rather than serving a partial map.
     if (redis_enabled_) {
+        if (redis_fence_epoch_ != 0 && !StampShardEpochs()) {
+            LOG(ERROR) << "DFS allocator failed to stamp the leader epoch";
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
         auto restore = RestoreFromRedis();
         if (!restore) {
             LOG(ERROR) << "DFS allocator failed to restore from Redis, error="
@@ -252,6 +258,13 @@ tl::expected<int, ErrorCode> ShardAllocator::ExpandShards(int target_count) {
                 return tl::make_unexpected(shard.error());
             }
             ready->push_back(std::move(*shard));
+        }
+        // New shard hashes must carry the current epoch before they can take
+        // writes; fail the expansion (and keep the old topology) otherwise.
+        if (!StampShardEpochRange(static_cast<int>(current->size()),
+                                  target_count)) {
+            CleanupCreatedFiles(created_files);
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
         }
         published_shards_.push_back(std::move(ready));
         shards_.store(published_shards_.back().get(),
@@ -1061,6 +1074,24 @@ bool ShardAllocator::DoRedisPersistRecord(RedisConn& conn,
                                          const std::string& field,
                                          const std::string& value) {
     if (!EnsureRedisConnected(conn)) return false;
+    if (redis_fence_epoch_ != 0) {
+        const std::string epoch = std::to_string(redis_fence_epoch_);
+        ha::common::redis::RedisReplyPtr reply(ha::common::redis::EvalScript(
+            conn.ctx.get(), ha::common::redis::kFencedHSetScript, hash_key,
+            {epoch, field, value}));
+        if (ha::common::redis::IsFenceMismatch(reply.get())) {
+            LOG(ERROR) << "DFS redis leader fence lost (HSET), key=" << hash_key;
+            return false;
+        }
+        if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "DFS redis fenced HSET failed, key=" << hash_key
+                       << " field=" << field
+                       << ", dropping connection for reconnect";
+            conn.ctx.reset();
+            return false;
+        }
+        return ha::common::redis::IsFenceMatch(reply.get());
+    }
     ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
         redisCommand(conn.ctx.get(), "HSET %s %s %b", hash_key.c_str(),
                      field.c_str(), value.data(), value.size())));
@@ -1078,6 +1109,24 @@ bool ShardAllocator::DoRedisRemoveAlloc(RedisConn& conn,
                                         const std::string& hash_key,
                                         const std::string& field) {
     if (!EnsureRedisConnected(conn)) return false;
+    if (redis_fence_epoch_ != 0) {
+        const std::string epoch = std::to_string(redis_fence_epoch_);
+        ha::common::redis::RedisReplyPtr reply(ha::common::redis::EvalScript(
+            conn.ctx.get(), ha::common::redis::kFencedHDelScript, hash_key,
+            {epoch, field}));
+        if (ha::common::redis::IsFenceMismatch(reply.get())) {
+            LOG(ERROR) << "DFS redis leader fence lost (HDEL), key=" << hash_key;
+            return false;
+        }
+        if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+            LOG(ERROR) << "DFS redis fenced HDEL failed, key=" << hash_key
+                       << " field=" << field
+                       << ", dropping connection for reconnect";
+            conn.ctx.reset();
+            return false;
+        }
+        return ha::common::redis::IsFenceMatch(reply.get());
+    }
     ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
         redisCommand(conn.ctx.get(), "HDEL %s %s", hash_key.c_str(),
                      field.c_str())));
@@ -1091,6 +1140,36 @@ bool ShardAllocator::DoRedisRemoveAlloc(RedisConn& conn,
     return true;
 }
 #endif
+
+bool ShardAllocator::StampShardEpochs() {
+    return StampShardEpochRange(0, GetShardCount());
+}
+
+bool ShardAllocator::StampShardEpochRange(int begin, int end) {
+    if (!redis_enabled_ || redis_fence_epoch_ == 0) return true;
+#ifndef STORE_USE_REDIS
+    return false;
+#else
+    auto conn = ha::common::redis::ConnectRedis(redis_connstring_);
+    if (!conn) {
+        LOG(ERROR) << "DFS redis epoch stamp: connect failed";
+        return false;
+    }
+    redisContext* ctx = conn.value().get();
+    const std::string epoch = std::to_string(redis_fence_epoch_);
+    for (int i = begin; i < end; ++i) {
+        ha::common::redis::RedisReplyPtr reply(ha::common::redis::EvalScript(
+            ctx, ha::common::redis::kStampEpochScript, ShardHashKey(i),
+            {epoch}));
+        if (reply == nullptr || reply->type != REDIS_REPLY_INTEGER) {
+            LOG(ERROR) << "DFS redis epoch stamp failed, shard=" << i;
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
 tl::expected<void, ErrorCode> ShardAllocator::RestoreFromRedis() {
     if (!redis_enabled_) return {};
 #ifndef STORE_USE_REDIS
@@ -1157,6 +1236,10 @@ tl::expected<uint64_t, ErrorCode> ShardAllocator::RestoreOneHash(
         for (size_t i = 0; i + 1 < kv->elements; i += 2) {
             redisReply* f = kv->element[i];
             redisReply* v = kv->element[i + 1];
+            if (std::string_view(f->str, f->len) ==
+                ha::common::redis::kFenceField) {
+                continue;
+            }
             uint64_t alloc_offset = 0;
             try {
                 alloc_offset = std::stoull(std::string(f->str, f->len));

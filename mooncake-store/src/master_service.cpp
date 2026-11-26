@@ -903,6 +903,9 @@ void MasterService::InitDfsAllocatorFromEnvironment(
             GetEnvInt("MOONCAKE_META_REDIS_PSCAN_SHARDS", 0);
         dfs_config.redis_write_conns =
             GetEnvInt("MOONCAKE_META_REDIS_WRITE_CONNS", 0);
+        // The shard ledger shares the metadata mirror's leader fence.
+        dfs_config.redis_fence_epoch =
+            meta_redis_ != nullptr ? meta_redis_->Epoch() : 0;
     } else {
         dfs_config.redis_connstring.clear();
     }
@@ -1063,6 +1066,13 @@ void MasterService::InitMetaRedisFromEnvironment(
               << ", pscan_shards=" << cfg.pscan_shards
               << ", write_conns=" << cfg.write_conns;
     meta_redis_ = std::make_unique<MasterMetaRedisStore>(std::move(cfg));
+    // Fence every mirror hash before serving. Without this, a leader that
+    // resumes after a freeze can still mutate Redis until its lease monitor
+    // notices the loss (stale deletes / ghost PutEnd).
+    if (!meta_redis_->StartLeaderEpoch()) {
+        LOG(FATAL) << "Meta redis failed to claim the leader epoch; refusing to "
+                      "serve without fencing";
+    }
 }
 
 void MasterService::RecoverFromMetaRedis() {

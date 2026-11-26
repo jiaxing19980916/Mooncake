@@ -6214,6 +6214,54 @@ TEST_F(MasterServiceTest, MetaRedisMirrorsSegmentLifecycle) {
 // A new serving term claims a newer epoch at MasterService construction. The
 // previous term must lose the ability to mutate the mirror: its late deletes
 // (client expiry) and late PutEnd must not touch keys the new leader owns.
+TEST_F(MasterServiceTest, MetaRedisNewLeaderFencesPreviousTerm) {
+    const char* connstring = std::getenv("MOONCAKE_META_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_META_REDIS_TEST_CONNSTRING is not set";
+    }
+    const std::string cluster_id =
+        "fence-live-" +
+        std::to_string(std::chrono::system_clock::now()
+                           .time_since_epoch()
+                           .count());
+    ScopedEnvVar enable_recovery("MOONCAKE_ENABLE_REDIS_RECOVERY", "1");
+    ScopedEnvVar redis_conn("MOONCAKE_META_REDIS_CONNSTRING", connstring);
+    ScopedEnvVar redis_conns("MOONCAKE_META_REDIS_WRITE_CONNS", "2");
+
+    MasterServiceConfig config;
+    config.cluster_id = cluster_id;
+    const UUID client_id = generate_uuid();
+    auto segment = MakeSegment("fenced-service-segment");
+
+    MasterService previous_term(config);
+    ASSERT_TRUE(previous_term.MountSegment(segment, client_id));
+
+    auto read_back = [&]() {
+        MasterMetaRedisStore::Config cfg;
+        cfg.connstring = connstring;
+        cfg.ns = cluster_id;
+        cfg.num_buckets = 1024;
+        MasterMetaRedisStore store(std::move(cfg));
+        auto segments = store.RecoverSegments();
+        EXPECT_TRUE(segments.has_value());
+        return segments.has_value() ? segments.value()
+                                    : std::vector<StandbySegmentInfo>{};
+    };
+    ASSERT_EQ(read_back().size(), 1u);
+
+    // A new term claims a newer epoch.
+    MasterService new_term(config);
+
+    // The stale leader cannot remove the new leader's segment mirror.
+    EXPECT_FALSE(previous_term.UnmountSegment(segment.id, client_id));
+    EXPECT_EQ(read_back().size(), 1u);
+
+    // The new leader can: its HDEL carries the current epoch.
+    ASSERT_TRUE(new_term.MountSegment(segment, client_id));
+    ASSERT_TRUE(new_term.UnmountSegment(segment.id, client_id));
+    EXPECT_TRUE(read_back().empty());
+}
+
 // Redis metadata recovery has a per-extent ledger only for the shard
 // allocator; bucket mode must be rejected at startup, before creating files.
 TEST_F(MasterServiceTest, RedisRecoveryRejectsBucketAllocator) {

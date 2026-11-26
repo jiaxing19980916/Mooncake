@@ -163,5 +163,57 @@ TEST(MasterMetaRedisStoreLive, ConcurrentActorsKeepEveryWrite) {
 // A stale leader must not be able to mutate the mirror after a newer leader
 // has claimed the epoch. This is the fencing guarantee that prevents a frozen
 // leader's late PutEnd / client-expiry deletes from poisoning Redis.
+TEST(MasterMetaRedisStoreLive, LeaderEpochFencesStaleWriter) {
+    const char* connstring = std::getenv("MOONCAKE_META_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_META_REDIS_TEST_CONNSTRING is not set";
+    }
+    const std::string ns = "fence-smoke-" +
+                           std::to_string(std::chrono::system_clock::now()
+                                              .time_since_epoch()
+                                              .count());
+    auto make_store = [&]() {
+        MasterMetaRedisStore::Config cfg;
+        cfg.connstring = connstring;
+        cfg.ns = ns;
+        cfg.num_buckets = 32;
+        cfg.write_conns = 2;
+        return std::make_unique<MasterMetaRedisStore>(std::move(cfg));
+    };
+    auto stale = make_store();
+    auto fresh = make_store();
+    ASSERT_TRUE(stale->StartLeaderEpoch());
+    ASSERT_TRUE(fresh->StartLeaderEpoch());
+    ASSERT_LT(stale->Epoch(), fresh->Epoch());
+
+    const std::string tenant = "default";
+    const std::string key = "fenced-key";
+    EXPECT_FALSE(stale->PutObject(0, tenant, key, "stale"));
+    EXPECT_TRUE(stale->FenceLost());
+    EXPECT_TRUE(fresh->PutObject(0, tenant, key, "fresh"));
+
+    EXPECT_FALSE(stale->DelObject(0, tenant, key));
+    EXPECT_TRUE(fresh->DelObject(0, tenant, key));
+
+    StandbySegmentInfo seg;
+    seg.segment_name = "fence-segment";
+    seg.transport_endpoint = "fence-segment:1";
+    seg.capacity = 4096;
+    seg.is_memory_segment = true;
+    EXPECT_FALSE(stale->PutSegment(seg));
+    EXPECT_TRUE(fresh->PutSegment(seg));
+    {
+        auto recovered = fresh->RecoverSegments();
+        ASSERT_TRUE(recovered.has_value());
+        ASSERT_EQ(recovered->size(), 1u);
+        EXPECT_EQ((*recovered)[0].transport_endpoint, seg.transport_endpoint);
+    }
+    EXPECT_FALSE(stale->DelSegment(seg.transport_endpoint));
+    EXPECT_TRUE(fresh->DelSegment(seg.transport_endpoint));
+    auto empty = fresh->RecoverSegments();
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->empty());
+}
+
 }  // namespace
 }  // namespace mooncake
