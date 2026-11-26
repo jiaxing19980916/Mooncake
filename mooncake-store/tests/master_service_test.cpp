@@ -1,7 +1,9 @@
 #include "master_service.h"
 #include "common/shrink_buckets.h"
 #include "config/replica_selection_config.h"
+#include "ha/kv/master_meta_redis_store.h"
 #include "master_service/master_service_test_peer.h"
+#include "storage/distributed/dfs_allocator_interface.h"
 #include "rpc_service.h"
 #include "storage/distributed/kvcs/kvcs_capacity_provider.h"
 #include "storage/distributed/kvcs/kvcs_driver.h"
@@ -6163,18 +6165,237 @@ TEST_F(MasterServiceTest,
 
 // Opt-in live test for the `<cluster_id>:seg` mirror. Set
 // MOONCAKE_META_REDIS_TEST_CONNSTRING (e.g. redis://127.0.0.1:6380) to run.
+TEST_F(MasterServiceTest, MetaRedisMirrorsSegmentLifecycle) {
+    const char* connstring = std::getenv("MOONCAKE_META_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_META_REDIS_TEST_CONNSTRING is not set";
+    }
+    const std::string cluster_id =
+        "seg-live-" +
+        std::to_string(std::chrono::system_clock::now()
+                           .time_since_epoch()
+                           .count());
+    ScopedEnvVar enable_recovery("MOONCAKE_ENABLE_REDIS_RECOVERY", "1");
+    ScopedEnvVar redis_conn("MOONCAKE_META_REDIS_CONNSTRING", connstring);
+    ScopedEnvVar redis_conns("MOONCAKE_META_REDIS_WRITE_CONNS", "2");
+
+    MasterServiceConfig config;
+    config.cluster_id = cluster_id;
+    MasterService service(config);
+
+    auto read_back = [&]() {
+        MasterMetaRedisStore::Config cfg;
+        cfg.connstring = connstring;
+        cfg.ns = cluster_id;
+        cfg.num_buckets = 1024;
+        MasterMetaRedisStore store(std::move(cfg));
+        auto segments = store.RecoverSegments();
+        EXPECT_TRUE(segments.has_value());
+        return segments.has_value() ? segments.value()
+                                    : std::vector<StandbySegmentInfo>{};
+    };
+
+    const UUID client_id = generate_uuid();
+    auto segment = MakeSegment("redis-live-segment");
+    ASSERT_TRUE(service.MountSegment(segment, client_id));
+    {
+        const auto segments = read_back();
+        ASSERT_EQ(segments.size(), 1u);
+        EXPECT_EQ(segments[0].segment_name, segment.name);
+        EXPECT_EQ(segments[0].transport_endpoint, segment.te_endpoint);
+        EXPECT_EQ(segments[0].capacity, segment.size);
+        EXPECT_TRUE(segments[0].is_memory_segment);
+    }
+
+    ASSERT_TRUE(service.UnmountSegment(segment.id, client_id));
+    EXPECT_TRUE(read_back().empty());
+}
+
 // A new serving term claims a newer epoch at MasterService construction. The
 // previous term must lose the ability to mutate the mirror: its late deletes
 // (client expiry) and late PutEnd must not touch keys the new leader owns.
 // Redis metadata recovery has a per-extent ledger only for the shard
 // allocator; bucket mode must be rejected at startup, before creating files.
+TEST_F(MasterServiceTest, RedisRecoveryRejectsBucketAllocator) {
+    const char* connstring = std::getenv("MOONCAKE_META_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_META_REDIS_TEST_CONNSTRING is not set";
+    }
+    ScopedEnvVar redis_recovery("MOONCAKE_ENABLE_REDIS_RECOVERY", "1");
+    ScopedEnvVar redis_conn("MOONCAKE_META_REDIS_CONNSTRING", connstring);
+    ScopedEnvVar dfs_enabled("MOONCAKE_DFS_ENABLED", "1");
+    ScopedEnvVar dfs_allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR",
+                          "/tmp/mooncake-redis-bucket-gate");
+
+    MasterServiceConfig config;
+    config.cluster_id =
+        "bucket-gate-" +
+        std::to_string(std::chrono::system_clock::now()
+                           .time_since_epoch()
+                           .count());
+    EXPECT_DEATH(
+        {
+            MasterService service(config);
+        },
+        "supports only the shard");
+}
+
 // The per-term MasterService constructor must rebuild objects + segments from
 // the Redis mirror before the HA supervisor is allowed to serve.
+TEST_F(MasterServiceTest, MetaRedisRecoversObjectsAndSegmentsAtConstruction) {
+    const char* connstring = std::getenv("MOONCAKE_META_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_META_REDIS_TEST_CONNSTRING is not set";
+    }
+    const std::string cluster_id =
+        "recover-live-" +
+        std::to_string(std::chrono::system_clock::now()
+                           .time_since_epoch()
+                           .count());
+    ScopedEnvVar enable_recovery("MOONCAKE_ENABLE_REDIS_RECOVERY", "1");
+    ScopedEnvVar redis_conn("MOONCAKE_META_REDIS_CONNSTRING", connstring);
+    ScopedEnvVar redis_conns("MOONCAKE_META_REDIS_WRITE_CONNS", "2");
+
+    MasterServiceConfig config;
+    config.cluster_id = cluster_id;
+    auto segment = MakeSegment("recover-segment");
+    const UUID client_id = generate_uuid();
+    std::string key;
+    {
+        MasterService previous(config);
+        ASSERT_TRUE(previous.MountSegment(segment, client_id));
+        key = PutObjectOnSegment(previous, client_id, segment.name);
+        ASSERT_TRUE(
+            previous.ExistKey(key, TenantId::Default()).value_or(false));
+    }
+
+    MasterService recovered(config);
+    // The restored endpoint stays unresolved until its owner remounts, exactly
+    // like the HA snapshot path. After ReMountSegment the object is readable.
+    ASSERT_TRUE(recovered.ReMountSegment({segment}, client_id));
+    auto exists = recovered.ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(*exists) << "object should be restored from the Redis mirror";
+}
+
 // DFS replica descriptors and the shard allocator ledger must both survive a
 // term: metadata comes from obj:*, the offset_to_handle map from oth:*.
+TEST_F(MasterServiceTest, MetaRedisRecoversDfsReplicaAtConstruction) {
+    const char* connstring = std::getenv("MOONCAKE_META_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_META_REDIS_TEST_CONNSTRING is not set";
+    }
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_redis_recover_" +
+                            std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+    ScopedEnvVar redis_recovery("MOONCAKE_ENABLE_REDIS_RECOVERY", "1");
+    ScopedEnvVar redis_conn("MOONCAKE_META_REDIS_CONNSTRING", connstring);
+    ScopedEnvVar redis_conns("MOONCAKE_META_REDIS_WRITE_CONNS", "2");
+
+    MasterServiceConfig config;
+    config.cluster_id =
+        "dfs-recover-" +
+        std::to_string(std::chrono::system_clock::now()
+                           .time_since_epoch()
+                           .count());
+    const std::string key = "dfs-recover-key";
+    {
+        MasterService previous(config);
+        const auto context = PrepareSimpleSegment(previous);
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        replicate.dfs_replica_num = 1;
+        auto start = previous.PutStart(context.client_id, key,
+                                       TenantId::Default(), 4096, replicate);
+        ASSERT_TRUE(start.has_value());
+        ASSERT_EQ(start->size(), 2u);
+        ASSERT_TRUE(previous
+                        .PutEnd(context.client_id, key, TenantId::Default(),
+                                ReplicaType::ALL)
+                        .has_value());
+    }
+
+    MasterService recovered(config);
+    auto replicas = recovered.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    size_t dfs_replicas = 0;
+    for (const auto& replica : replicas->replicas) {
+        if (replica.is_dfs_replica()) ++dfs_replicas;
+    }
+    EXPECT_EQ(dfs_replicas, 1u);
+    auto& allocator = MasterServiceTestPeer::DfsAllocator(recovered);
+    ASSERT_NE(allocator, nullptr);
+    EXPECT_GT(allocator->GetUsedBytes(), 0u)
+        << "oth:* ledger should be rebuilt by RestoreFromRedis";
+
+    std::filesystem::remove_all(dfs_root);
+}
+
 // A client that never reconnects must not leave its recovered segment in
 // Redis forever: after the grace window the object replicas are swept and the
 // seg:* entry is deleted.
+TEST_F(MasterServiceTest, MetaRedisPrunesStaleStandbySegmentAfterGrace) {
+    const char* connstring = std::getenv("MOONCAKE_META_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_META_REDIS_TEST_CONNSTRING is not set";
+    }
+    ScopedEnvVar enable_recovery("MOONCAKE_ENABLE_REDIS_RECOVERY", "1");
+    ScopedEnvVar redis_conn("MOONCAKE_META_REDIS_CONNSTRING", connstring);
+    ScopedEnvVar redis_conns("MOONCAKE_META_REDIS_WRITE_CONNS", "2");
+
+    MasterServiceConfig config;
+    config.cluster_id =
+        "prune-live-" +
+        std::to_string(std::chrono::system_clock::now()
+                           .time_since_epoch()
+                           .count());
+    {
+        MasterService previous(config);
+        auto segment = MakeSegment("prune-segment");
+        const UUID client_id = generate_uuid();
+        ASSERT_TRUE(previous.MountSegment(segment, client_id));
+        (void)PutObjectOnSegment(previous, client_id, segment.name);
+    }
+
+    ScopedEnvVar grace("MOONCAKE_META_REDIS_STALE_SEGMENT_GRACE_MS", "0");
+    MasterService recovered(config);
+
+    MasterMetaRedisStore::Config cfg;
+    cfg.connstring = connstring;
+    cfg.ns = config.cluster_id;
+    cfg.num_buckets = 1024;
+    MasterMetaRedisStore reader(std::move(cfg));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto segments = reader.RecoverSegments();
+        auto objects = reader.RecoverObjects();
+        if (segments.has_value() && segments->empty() &&
+            objects.has_value() && objects->empty()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    auto segments = reader.RecoverSegments();
+    ASSERT_TRUE(segments.has_value());
+    EXPECT_TRUE(segments->empty());
+    auto objects = reader.RecoverObjects();
+    ASSERT_TRUE(objects.has_value());
+    EXPECT_TRUE(objects->empty());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

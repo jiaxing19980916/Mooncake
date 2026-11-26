@@ -31,6 +31,7 @@ class MasterMetaRedisStore {
     struct Config {
         std::string connstring;     // empty => store disabled
         std::string ns;             // key namespace, = cluster_id
+        int pscan_shards = 0;       // >1 => concurrent PSCAN recovery
         size_t num_buckets = 1024;  // MUST match MasterService shard count
         // Number of Redis connections writes are striped across (keyed by
         // object bucket). <=1 => a single connection (legacy behavior). >1 lets
@@ -83,6 +84,10 @@ class MasterMetaRedisStore {
     // Returns true on success (or when disabled -> no-op), false on HDEL
     // failure, so unmount can retry while the segment is still in memory.
     bool DelSegment(std::string_view transport_endpoint);
+
+    // ---- read side (leader promotion) ----
+    tl::expected<std::vector<StandbyObjectEntry>, ErrorCode> RecoverObjects();
+    tl::expected<std::vector<StandbySegmentInfo>, ErrorCode> RecoverSegments();
 
     // ---- key/field codec (public for unit tests) ----
     // field = hex4(tenant.size()) + tenant + key  (fixed-length prefix keeps it
@@ -142,6 +147,11 @@ class MasterMetaRedisStore {
                               std::string_view tenant_id, std::string_view key,
                               std::string_view payload,
                               const std::vector<HSetCmd>& extra);
+    tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
+    RecoverObjectsConcurrent(int num_pshards);
+    tl::expected<uint64_t, ErrorCode> RecoverOneObjectHash(
+        redisContext* ctx, const std::string& hash_key,
+        std::vector<StandbyObjectEntry>& out);
 #endif
 
     Config config_;

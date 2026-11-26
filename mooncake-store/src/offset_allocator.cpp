@@ -3,6 +3,7 @@
 
 #include "offset_allocator/offset_allocator.h"
 
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -786,6 +787,144 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
     OffsetAllocation allocation(node.dataOffset, node_index);
     return OffsetAllocationHandle(weak_from_this(), allocation, real_offset,
                                   requested_size);
+}
+
+std::vector<uint32> __Allocator::rebuildFromUsedRegions(
+    const std::vector<std::pair<uint32, uint32>>& used_regions) {
+    // Validate ordering / non-overlap / in-range before mutating any state.
+    uint64_t cursor = 0;
+    for (const auto& [off, size] : used_regions) {
+        if (size == 0) return {};
+        if (off < cursor) return {};
+        if (static_cast<uint64_t>(off) + size > m_size) return {};
+        cursor = static_cast<uint64_t>(off) + size;
+    }
+
+    // Re-initialize to an empty allocator (no whole-space free node yet).
+    m_freeStorage = 0;
+    m_usedBinsTop = 0;
+    m_freeOffset = 0;
+    for (uint32 i = 0; i < NUM_TOP_BINS; i++) m_usedBins[i] = 0;
+    for (uint32 i = 0; i < NUM_LEAF_BINS; i++) m_binIndices[i] = Node::unused;
+    m_nodes.clear();
+    m_freeNodes.clear();
+    m_nodes.reserve(m_max_capacity);
+    m_freeNodes.reserve(m_max_capacity);
+    m_nodes.resize(m_current_capacity);
+    m_freeNodes.resize(m_current_capacity);
+    for (uint32 i = 0; i < m_current_capacity; i++) m_freeNodes[i] = i;
+
+    uint32 prev_node = Node::unused;
+    auto link_neighbor = [&](uint32 node_index) {
+        if (prev_node != Node::unused) {
+            m_nodes[prev_node].neighborNext = node_index;
+            m_nodes[node_index].neighborPrev = prev_node;
+        }
+        prev_node = node_index;
+    };
+    auto ensure_slot = [&]() -> bool {
+        if (m_freeOffset == m_max_capacity) return false;
+        if (m_freeOffset == m_current_capacity) {
+            m_freeNodes.push_back(m_current_capacity);
+            m_nodes.emplace_back();
+            m_current_capacity++;
+        }
+        return true;
+    };
+    auto add_free = [&](uint32 off, uint32 size) -> bool {
+        if (!ensure_slot()) return false;
+        uint32 idx = insertNodeIntoBin(size, off);
+        link_neighbor(idx);
+        return true;
+    };
+    auto add_used = [&](uint32 off, uint32 size) -> uint32 {
+        if (!ensure_slot()) return Node::unused;
+        uint32 idx = m_freeNodes[m_freeOffset++];
+        m_nodes[idx] = {.dataOffset = off, .dataSize = size, .used = true};
+        link_neighbor(idx);
+        return idx;
+    };
+
+    std::vector<uint32> result;
+    result.reserve(used_regions.size());
+    cursor = 0;
+    for (const auto& [off, size] : used_regions) {
+        if (off > cursor) {
+            if (!add_free(static_cast<uint32>(cursor),
+                          static_cast<uint32>(off - cursor)))
+                return {};
+        }
+        uint32 idx = add_used(off, size);
+        if (idx == Node::unused) return {};
+        result.push_back(idx);
+        cursor = static_cast<uint64_t>(off) + size;
+    }
+    if (cursor < m_size) {
+        if (!add_free(static_cast<uint32>(cursor),
+                      static_cast<uint32>(m_size - cursor)))
+            return {};
+    }
+    return result;
+}
+
+std::optional<std::vector<std::pair<uint64_t, OffsetAllocationHandle>>>
+OffsetAllocator::rebuildFromRegions(std::vector<RecoveredRegion> regions) {
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator) return std::nullopt;
+
+    const uint64_t quantum = uint64_t{1} << m_multiplier_bits;
+
+    struct FakeRegion {
+        uint32 off;
+        uint32 size;
+        uint64_t real_offset;
+        uint64_t requested_size;
+    };
+    std::vector<FakeRegion> fake;
+    fake.reserve(regions.size());
+    for (const auto& r : regions) {
+        if (r.real_offset < m_base) return std::nullopt;
+        const uint64_t rel = r.real_offset - m_base;
+        if ((rel & (quantum - 1)) != 0) return std::nullopt;
+        if (r.allocation_size == 0 || (r.allocation_size & (quantum - 1)) != 0)
+            return std::nullopt;
+        const uint64_t fake_off = rel >> m_multiplier_bits;
+        const uint64_t fake_size = r.allocation_size >> m_multiplier_bits;
+        if (fake_off > std::numeric_limits<uint32>::max() ||
+            fake_size == 0 || fake_size > std::numeric_limits<uint32>::max())
+            return std::nullopt;
+        fake.push_back({static_cast<uint32>(fake_off),
+                        static_cast<uint32>(fake_size), r.real_offset,
+                        r.requested_size});
+    }
+
+    std::sort(fake.begin(), fake.end(),
+              [](const FakeRegion& a, const FakeRegion& b) {
+                  return a.off < b.off;
+              });
+
+    std::vector<std::pair<uint32, uint32>> used;
+    used.reserve(fake.size());
+    for (const auto& f : fake) used.emplace_back(f.off, f.size);
+
+    std::vector<uint32> nodes = m_allocator->rebuildFromUsedRegions(used);
+    if (nodes.size() != fake.size() && !fake.empty()) return std::nullopt;
+
+    m_allocated_size = 0;
+    m_allocated_num = fake.size();
+    for (const auto& f : fake) m_allocated_size += f.requested_size;
+    refreshLargestFreeRegion();
+
+    std::vector<std::pair<uint64_t, OffsetAllocationHandle>> handles;
+    handles.reserve(fake.size());
+    for (size_t i = 0; i < fake.size(); ++i) {
+        OffsetAllocation allocation(fake[i].off, nodes[i]);
+        handles.emplace_back(
+            fake[i].real_offset,
+            OffsetAllocationHandle(shared_from_this(), allocation,
+                                   fake[i].real_offset, fake[i].requested_size));
+    }
+    return handles;
 }
 
 }  // namespace mooncake::offset_allocator

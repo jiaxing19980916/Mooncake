@@ -210,6 +210,12 @@ class ShardAllocator final : public DfsAllocatorInterface {
                             const std::string& field,
                             const std::string& value);
     bool RedisRemoveAlloc(int shard_idx, uint64_t alloc_offset);
+    // Rebuild every shard's allocator + offset_to_handle from Redis. Called
+    // once from Init(); corrupt/overlapping data aborts startup.
+    tl::expected<void, ErrorCode> RestoreFromRedis();
+    tl::expected<uint64_t, ErrorCode> RestoreOneHash(redisContext* ctx,
+                                                     int shard_idx,
+                                                     const std::string& hash_key);
 
     std::string mount_path_;
     uint64_t shard_capacity_ = 0;

@@ -160,6 +160,10 @@ WrappedMasterService::GetRestoreLifecycleState() const {
     return master_service_.GetRestoreLifecycleState();
 }
 
+bool WrappedMasterService::RedisRecoveryEnabled() const {
+    return master_service_.RedisRecoveryEnabled();
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();

@@ -951,6 +951,10 @@ class MasterService {
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
         const WeightMetadataSnapshot& weight_metadata = {});
+    // True when the master rebuilds its state from the Redis mirror instead of
+    // the snapshot/oplog standby path. The HA supervisor uses this to skip
+    // RestoreFromStandby after the constructor already recovered.
+    bool RedisRecoveryEnabled() const { return redis_recovery_enabled_; }
     // Copies objects out of the handoff. The caller keeps ownership so a
     // failed restore or a later lease loss can still PreservePromotionBaseline.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
@@ -1190,6 +1194,9 @@ class MasterService {
     // Returns the first Redis mirror error: an entry that could not be
     // converged keeps its replicas, so a retry can finish the sweep.
     tl::expected<void, ErrorCode> ClearInvalidHandlesLocked();
+    // Drop standby-recovered segments whose client never remounted within
+    // MOONCAKE_META_REDIS_STALE_SEGMENT_GRACE_MS, mirror included.
+    void PruneStaleStandbySegments();
     // Clear completed LOCAL_DISK replicas owned by exactly this client during
     // explicit unmount, even if its session still retains resources.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
@@ -2051,6 +2058,9 @@ class MasterService {
     // Redis object-table mirror. Enabled only when
     // MOONCAKE_ENABLE_REDIS_RECOVERY is on; meta_redis_ is then non-null.
     bool redis_recovery_enabled_{false};
+    // How long a standby-recovered memory endpoint may stay unresolved before
+    // the client is declared gone and its seg:* mirror is pruned.
+    int64_t meta_redis_stale_segment_grace_ms_{60000};
     std::unique_ptr<MasterMetaRedisStore> meta_redis_;
     static constexpr size_t kMetaRedisBuckets = 1024;
 
@@ -2339,6 +2349,9 @@ class MasterService {
     // ---- Redis object-table mirror (MOONCAKE_ENABLE_REDIS_RECOVERY) ----
     // Construct meta_redis_ from the environment. No-op when the switch is off.
     void InitMetaRedisFromEnvironment(const MasterServiceConfig& config);
+    // Rebuild objects + segments from the Redis mirror at construction time.
+    // Fatal when the mirror is on but recovery fails (never serve partial).
+    void RecoverFromMetaRedis();
     // HSET one committed object's metadata. Returns false only on a Redis error
     // so PutEnd can gate its commit; no-op when the mirror is disabled.
     bool MirrorObjectToRedis(const TenantId& tenant_id, const std::string& key,
@@ -2433,6 +2446,11 @@ class MasterService {
     // Standby-restored memory endpoints remain unreadable until the owning
     // Client has successfully remounted them.
     std::unordered_set<std::string> invalid_replica_endpoints_;
+    // Grace deadline for each such endpoint when the Redis mirror is on; a
+    // client that never reconnects is pruned with its seg:* entry.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        invalid_endpoint_deadline_;
+    std::atomic<bool> has_invalid_replica_endpoints_{false};
 
     // Keep DummyBufferAllocator alive after standby restore.
     // Key: transport_endpoint, Value: allocator.

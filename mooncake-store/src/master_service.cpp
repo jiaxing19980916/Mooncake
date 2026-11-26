@@ -747,6 +747,18 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     InitMetaRedisFromEnvironment(config);
     InitDfsAllocatorFromEnvironment(config);
+    // The shard allocator mirrors its offset_to_handle ledger to Redis. Bucket
+    // mode has no per-extent ledger (immutable files), so it cannot recover.
+    if (redis_recovery_enabled_ && bucket_allocator_ != nullptr) {
+        LOG(FATAL) << "MOONCAKE_ENABLE_REDIS_RECOVERY is not supported with "
+                      "the bucket DFS allocator; use allocator_type=shard";
+    }
+    // Rebuild objects + segments from the mirror before any business worker or
+    // RPC can observe the service. The shard allocator has already restored
+    // oth:* at Init, so DFS replicas validate against the ledger.
+    if (redis_recovery_enabled_) {
+        RecoverFromMetaRedis();
+    }
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
     kv_events_enabled_ = kv_event_publisher_ && kv_event_publisher_->enabled();
@@ -887,6 +899,8 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         dfs_config.redis_connstring =
             GetEnvString("MOONCAKE_META_REDIS_CONNSTRING");
         dfs_config.redis_namespace = cluster_id_;
+        dfs_config.redis_pscan_shards =
+            GetEnvInt("MOONCAKE_META_REDIS_PSCAN_SHARDS", 0);
         dfs_config.redis_write_conns =
             GetEnvInt("MOONCAKE_META_REDIS_WRITE_CONNS", 0);
     } else {
@@ -1026,6 +1040,7 @@ void MasterService::InitMetaRedisFromEnvironment(
     MasterMetaRedisStore::Config cfg;
     cfg.connstring = GetEnvString("MOONCAKE_META_REDIS_CONNSTRING");
     cfg.ns = cluster_id_;
+    cfg.pscan_shards = GetEnvInt("MOONCAKE_META_REDIS_PSCAN_SHARDS", 0);
     cfg.write_conns = GetEnvInt("MOONCAKE_META_REDIS_WRITE_CONNS", 0);
     {
         const int chunk_raw =
@@ -1033,6 +1048,8 @@ void MasterService::InitMetaRedisFromEnvironment(
         const int chunk = std::clamp(chunk_raw, 16, 8192);
         cfg.hdel_chunk_fields = static_cast<size_t>(chunk);
     }
+    meta_redis_stale_segment_grace_ms_ = std::max<int64_t>(
+        0, GetEnvInt("MOONCAKE_META_REDIS_STALE_SEGMENT_GRACE_MS", 60000));
     cfg.num_buckets = kMetaRedisBuckets;
     if (cfg.connstring.empty()) {
         LOG(FATAL) << "MOONCAKE_META_REDIS_CONNSTRING must be set when "
@@ -1043,10 +1060,68 @@ void MasterService::InitMetaRedisFromEnvironment(
                         "will not be namespaced, risking collisions";
     }
     LOG(INFO) << "Meta redis ENABLED: namespace=" << cluster_id_
+              << ", pscan_shards=" << cfg.pscan_shards
               << ", write_conns=" << cfg.write_conns;
     meta_redis_ = std::make_unique<MasterMetaRedisStore>(std::move(cfg));
 }
 
+void MasterService::RecoverFromMetaRedis() {
+    if (!meta_redis_ || !meta_redis_->Enabled()) return;
+    const auto recover_start = std::chrono::steady_clock::now();
+    auto objects = meta_redis_->RecoverObjects();
+    if (!objects) {
+        LOG(FATAL) << "MetaRedis recover: failed to read objects, err="
+                   << static_cast<int>(objects.error());
+        return;
+    }
+    auto segments = meta_redis_->RecoverSegments();
+    if (!segments) {
+        LOG(FATAL) << "MetaRedis recover: failed to read segments, err="
+                   << static_cast<int>(segments.error());
+        return;
+    }
+    // The shard allocator restored oth:* during Init, so DFS replicas in the
+    // object entries validate against the ledger. RestoreFromStandbySnapshot
+    // publishes the object/segment tables and drives the restore lifecycle to
+    // kReady; the HA supervisor then skips the standby restore.
+    auto result = RestoreFromStandbySnapshot(
+        objects.value(), /*initial_oplog_sequence_id=*/0, segments.value(),
+        WeightMetadataSnapshot{});
+    if (!result) {
+        LOG(FATAL) << "MetaRedis recover: RestoreFromStandbySnapshot failed, "
+                      "err="
+                   << static_cast<int>(result.error());
+        return;
+    }
+    const auto recover_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - recover_start)
+            .count();
+    LOG(INFO) << "MetaRedis recover: restored " << objects.value().size()
+              << " objects and " << segments.value().size() << " segments in "
+              << recover_ms << " ms";
+
+    // States that the Redis mirror does not carry yet. Keep these explicit so
+    // an operator does not assume a full failover restore.
+    LOG(WARNING) << "MetaRedis recover: WeightMetadataSnapshot is not backed up "
+                    "to Redis yet; weight revisions/leases/residency "
+                    "operations will not survive failover";
+#ifdef USE_NOF
+    LOG(WARNING) << "MetaRedis recover: NoF segment registrations are not "
+                    "mirrored to Redis; clients must re-register NoF segments "
+                    "after failover";
+#endif
+    if (enable_offload_) {
+        LOG(WARNING) << "MetaRedis recover: LOCAL_DISK client registrations and "
+                        "capacity are not mirrored to Redis; clients must "
+                        "re-register local disk segments after failover";
+    }
+    if (use_kvcs_) {
+        LOG(WARNING) << "MetaRedis recover: KVCS provider data/capacity is not "
+                        "mirrored by the master; only object metadata is "
+                        "restored";
+    }
+}
 
 size_t MasterService::MetaRedisBucket(const TenantId& tenant_id,
                                       const std::string& key) const {
@@ -1814,8 +1889,14 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             }
             invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
             invalid_replica_endpoints_.erase(restore.segment.name);
+            invalid_endpoint_deadline_.erase(restore.segment.te_endpoint);
+            invalid_endpoint_deadline_.erase(restore.segment.name);
             standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
             standby_allocator_keepalive_.erase(restore.segment.name);
+        }
+        if (invalid_endpoint_deadline_.empty()) {
+            has_invalid_replica_endpoints_.store(false,
+                                                 std::memory_order_relaxed);
         }
         for (const auto& [tenant_id, object] : affected_objects) {
             MetadataAccessorRW accessor(this, tenant_id, object);
@@ -2843,6 +2924,93 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
         return replica.is_local_disk_replica() && replica.is_completed() &&
                replica.get_local_disk_client_id() == owner;
     });
+}
+
+void MasterService::PruneStaleStandbySegments() {
+    if (!meta_redis_ || !meta_redis_->Enabled()) {
+        has_invalid_replica_endpoints_.store(false, std::memory_order_relaxed);
+        return;
+    }
+
+    std::unordered_set<std::string> pruned;
+    {
+        std::unique_lock<std::shared_mutex> lock(master_state_mutex_);
+        if (invalid_endpoint_deadline_.empty()) {
+            has_invalid_replica_endpoints_.store(false,
+                                                 std::memory_order_relaxed);
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        for (const auto& [endpoint, deadline] : invalid_endpoint_deadline_) {
+            if (deadline >= now) continue;
+            for (const auto& segment : standby_memory_segments_) {
+                if (segment.transport_endpoint != endpoint &&
+                    segment.segment_name != endpoint) {
+                    continue;
+                }
+                pruned.insert(segment.transport_endpoint);
+                pruned.insert(segment.segment_name);
+                break;
+            }
+        }
+    }
+    if (pruned.empty()) return;
+
+    // Remove the object replicas that still point at these dead endpoints
+    // before the segment mirror is deleted, so a crash cannot leave an object
+    // referencing a segment that no longer exists. ClearStaleHandles is
+    // Redis-first per key and erases an object whose last replica goes.
+    {
+        std::shared_lock<std::shared_mutex> lock(master_state_mutex_);
+        auto swept = ClearStaleHandles([&pruned](const Replica& replica) {
+            if (!replica.is_completed() || !replica.is_memory_replica()) {
+                return false;
+            }
+            const auto endpoint = replica.transport_endpoint();
+            return endpoint && pruned.contains(*endpoint);
+        });
+        if (!swept) {
+            LOG(WARNING) << "prune_stale_standby_segment: object sweep failed, "
+                            "retrying later";
+            return;
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> lock(master_state_mutex_);
+    std::vector<StandbySegmentInfo> surviving;
+    surviving.reserve(standby_memory_segments_.size());
+    for (auto& segment : standby_memory_segments_) {
+        if (!pruned.contains(segment.transport_endpoint)) {
+            surviving.push_back(std::move(segment));
+            continue;
+        }
+        // A client may have remounted between the two lock windows.
+        if (!invalid_replica_endpoints_.contains(segment.transport_endpoint) &&
+            !invalid_replica_endpoints_.contains(segment.segment_name)) {
+            surviving.push_back(std::move(segment));
+            continue;
+        }
+        if (!RemoveSegmentFromRedis(segment.transport_endpoint)) {
+            // Keep the local entry and its deadline; retry on the next pass.
+            surviving.push_back(std::move(segment));
+            continue;
+        }
+        LOG(INFO) << "action=prune_stale_standby_segment_from_redis"
+                  << ", endpoint=" << segment.transport_endpoint
+                  << ", segment_name=" << segment.segment_name
+                  << ", grace_ms=" << meta_redis_stale_segment_grace_ms_;
+        invalid_replica_endpoints_.erase(segment.transport_endpoint);
+        invalid_replica_endpoints_.erase(segment.segment_name);
+        invalid_endpoint_deadline_.erase(segment.transport_endpoint);
+        invalid_endpoint_deadline_.erase(segment.segment_name);
+        standby_allocator_keepalive_.erase(segment.transport_endpoint);
+        standby_allocator_keepalive_.erase(segment.segment_name);
+        standby_accounted_memory_bytes_.erase(segment.segment_name);
+    }
+    standby_memory_segments_ = std::move(surviving);
+    if (invalid_endpoint_deadline_.empty()) {
+        has_invalid_replica_endpoints_.store(false, std::memory_order_relaxed);
+    }
 }
 
 tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
@@ -3921,7 +4089,9 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     ctx.owners.FindOrCreate(local_disk_desc.client_id)));
             } else if (desc.is_dfs_replica()) {
                 const auto& dfs_desc = desc.get_dfs_descriptor();
-                if (!use_kvcs_ ||
+                const bool dfs_backing_ready =
+                    use_kvcs_ || dfs_allocator_ != nullptr;
+                if (!dfs_backing_ready ||
                     dfs_desc.object_size != standby_meta.size) {
                     NoteLegacyStandbyRejection(ctx, entry,
                                                "invalid_dfs_descriptor");
@@ -4166,6 +4336,11 @@ MasterService::RestoreLifecycleState MasterService::GetRestoreLifecycleState()
 }
 
 void MasterService::MarkReadyForServing() {
+    if (lifecycle_state_.load(std::memory_order_acquire) ==
+        RestoreLifecycleState::kReady) {
+        // Constructor-time Redis recovery already committed the restore.
+        return;
+    }
     RestoreLifecycleState expected = RestoreLifecycleState::kConstructed;
     if (!lifecycle_state_.compare_exchange_strong(
             expected, RestoreLifecycleState::kReady)) {
@@ -4215,10 +4390,18 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id,
     const WeightMetadataSnapshot* legacy_weight_metadata) {
-    if (enable_dfs_ && !use_kvcs_) {
+    if (enable_dfs_ && !use_kvcs_ && !redis_recovery_enabled_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
-                      "restoration is not supported";
+                      "restoration requires the Redis allocator ledger";
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    }
+    if (enable_dfs_ && !use_kvcs_ && redis_recovery_enabled_) {
+        // The shard allocator's offset_to_handle was persisted/restored from
+        // Redis independently at Init(); the promoting primary already has its
+        // state. Continue with the object/segment restore below.
+        LOG(INFO) << "RestoreFromStandbySnapshot: DFS allocator state is "
+                     "restored from Redis at Init; proceeding with "
+                     "object/segment restore";
     }
     if ((legacy_objects == nullptr) == (metadata_store == nullptr) ||
         (metadata_store && chunk_object_count == 0) ||
@@ -4503,7 +4686,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
                         restore.FindOrCreate(local_disk_desc.client_id)));
                 } else if (desc.is_dfs_replica()) {
                     const auto& dfs_desc = desc.get_dfs_descriptor();
-                    if (!use_kvcs_ ||
+                    // In shard mode the ledger was rebuilt from Redis at Init;
+                    // in KVCS mode the descriptor is opaque object metadata.
+                    const bool dfs_backing_ready =
+                        use_kvcs_ || dfs_allocator_ != nullptr;
+                    if (!dfs_backing_ready ||
                         dfs_desc.object_size != standby_meta.size) {
                         LOG(ERROR)
                             << "RestoreFromStandbySnapshot: invalid DFS "
@@ -4614,6 +4801,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyStateCore(
     standby_memory_segments_ = std::move(restored_memory_segments);
     standby_allocator_keepalive_ = std::move(restored_allocators);
     invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+    // A client that never reconnects must not keep its seg:* entry forever.
+    invalid_endpoint_deadline_.clear();
+    if (meta_redis_ && meta_redis_->Enabled() &&
+        !invalid_replica_endpoints_.empty()) {
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(meta_redis_stale_segment_grace_ms_);
+        for (const auto& endpoint : invalid_replica_endpoints_) {
+            invalid_endpoint_deadline_[endpoint] = deadline;
+        }
+    }
+    has_invalid_replica_endpoints_.store(
+        !invalid_endpoint_deadline_.empty(), std::memory_order_relaxed);
 
     if (max_live_id != 0) {
         const ReplicaID desired_next_id = max_live_id + 1;
@@ -10529,6 +10729,7 @@ void MasterService::EvictionThreadFunc() {
 
     auto last_discard_time = std::chrono::system_clock::now();
     auto next_dfs_eviction_time = std::chrono::steady_clock::now();
+    auto next_stale_segment_prune = std::chrono::steady_clock::now();
     while (eviction_running_) {
         // RFC #4700 slice 1: eviction, tenant watermark eviction, DFS/NoF
         // eviction, expired-processing discard and promotion retry all
@@ -10538,6 +10739,14 @@ void MasterService::EvictionThreadFunc() {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(kEvictionThreadSleepMs));
             continue;
+        }
+
+        if (has_invalid_replica_endpoints_.load(std::memory_order_relaxed)) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_stale_segment_prune) {
+                PruneStaleStandbySegments();
+                next_stale_segment_prune = steady_now + std::chrono::seconds(1);
+            }
         }
 
         const auto now = std::chrono::system_clock::now();

@@ -467,6 +467,197 @@ bool MasterMetaRedisStore::DelSegment(std::string_view transport_endpoint) {
                             ConnSlot& s) { return HDel(s, hash_key, field); });
 }
 
+
+// ---- read side (leader promotion) ------------------------------------------
+
+tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
+MasterMetaRedisStore::RecoverObjects() {
+    if (!Enabled()) return std::vector<StandbyObjectEntry>{};
+    if (config_.pscan_shards > 1) {
+        return RecoverObjectsConcurrent(config_.pscan_shards);
+    }
+    // Sequential path uses a private connection: slot 0 is owned by its actor.
+    auto conn = ha::common::redis::ConnectRedis(config_.connstring);
+    if (!conn) return tl::make_unexpected(conn.error());
+    redisContext* ctx = conn.value().get();
+    std::vector<StandbyObjectEntry> out;
+    for (size_t b = 0; b < config_.num_buckets; ++b) {
+        auto restored = RecoverOneObjectHash(ctx, ObjHashKey(b), out);
+        if (!restored) return tl::make_unexpected(restored.error());
+    }
+    LOG(INFO) << "MetaRedis restored " << out.size()
+              << " objects from Redis (sequential)";
+    return out;
+}
+
+tl::expected<std::vector<StandbySegmentInfo>, ErrorCode>
+MasterMetaRedisStore::RecoverSegments() {
+    if (!Enabled()) return std::vector<StandbySegmentInfo>{};
+    std::vector<StandbySegmentInfo> out;
+    const std::string hash_key = SegHashKey();
+    auto conn = ha::common::redis::ConnectRedis(config_.connstring);
+    if (!conn) return tl::make_unexpected(conn.error());
+    redisContext* ctx = conn.value().get();
+    ha::common::redis::RedisReplyPtr reply(
+        static_cast<redisReply*>(redisCommand(ctx, "HGETALL %s",
+                                              hash_key.c_str())));
+    if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY) {
+        LOG(ERROR) << "MetaRedis HGETALL failed, key=" << hash_key;
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    for (size_t i = 0; i + 1 < reply->elements; i += 2) {
+        redisReply* f = reply->element[i];
+        redisReply* v = reply->element[i + 1];
+        StandbySegmentInfo seg;
+        if (struct_pack::deserialize_to(
+                seg, std::string_view(v->str, v->len)) !=
+            struct_pack::errc::ok) {
+            LOG(ERROR) << "MetaRedis restore: corrupt segment value in "
+                       << hash_key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        out.push_back(std::move(seg));
+    }
+    LOG(INFO) << "MetaRedis restored " << out.size() << " segments from Redis";
+    return out;
+}
+
+tl::expected<uint64_t, ErrorCode> MasterMetaRedisStore::RecoverOneObjectHash(
+    redisContext* ctx, const std::string& hash_key,
+    std::vector<StandbyObjectEntry>& out) {
+    uint64_t restored = 0;
+    std::string cursor = "0";
+    do {
+        ha::common::redis::RedisReplyPtr reply(
+            static_cast<redisReply*>(redisCommand(ctx, "HSCAN %s %s COUNT 1000",
+                                                  hash_key.c_str(),
+                                                  cursor.c_str())));
+        if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY ||
+            reply->elements != 2) {
+            LOG(ERROR) << "MetaRedis HSCAN failed, key=" << hash_key;
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        cursor.assign(reply->element[0]->str, reply->element[0]->len);
+        redisReply* kv = reply->element[1];
+        for (size_t i = 0; i + 1 < kv->elements; i += 2) {
+            redisReply* f = kv->element[i];
+            redisReply* v = kv->element[i + 1];
+            std::string_view field(f->str, f->len);
+            std::string tenant_id;
+            std::string key;
+            if (!DecodeField(field, tenant_id, key)) {
+                LOG(ERROR) << "MetaRedis restore: bad field in " << hash_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            MetadataPayload payload;
+            if (struct_pack::deserialize_to(
+                    payload, std::string_view(v->str, v->len)) !=
+                struct_pack::errc::ok) {
+                LOG(ERROR) << "MetaRedis restore: corrupt value in " << hash_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            StandbyObjectEntry entry;
+            entry.tenant_id = std::move(tenant_id);
+            entry.key = std::move(key);
+            entry.metadata = payload.ToStandbyMetadata();
+            out.push_back(std::move(entry));
+            ++restored;
+        }
+    } while (cursor != "0");
+    return restored;
+}
+
+tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
+MasterMetaRedisStore::RecoverObjectsConcurrent(int num_pshards) {
+    const std::string pattern = ObjHashPrefix() + "*";
+    std::vector<tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>>
+        results(num_pshards,
+                tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>(
+                    std::vector<StandbyObjectEntry>{}));
+    std::vector<std::thread> threads;
+    threads.reserve(num_pshards);
+
+    for (int p = 0; p < num_pshards; ++p) {
+        threads.emplace_back([this, p, &pattern, &results]() {
+            results[p] =
+                [&]() -> tl::expected<std::vector<StandbyObjectEntry>,
+                                      ErrorCode> {
+                auto conn = ha::common::redis::ConnectRedis(config_.connstring);
+                if (!conn) {
+                    LOG(ERROR) << "MetaRedis restore(PSCAN): connect failed for "
+                                  "physical shard "
+                               << p;
+                    return tl::make_unexpected(conn.error());
+                }
+                redisContext* ctx = conn.value().get();
+
+                // Discover the obj:* hashes living on this physical shard.
+                // SCAN may return duplicates across iterations, so dedupe.
+                std::unordered_set<std::string> hash_keys;
+                std::string cursor = "0";
+                do {
+                    ha::common::redis::RedisReplyPtr reply(
+                        static_cast<redisReply*>(redisCommand(
+                            ctx, "PSCAN %d %s MATCH %s COUNT 1000", p,
+                            cursor.c_str(), pattern.c_str())));
+                    if (reply == nullptr ||
+                        reply->type != REDIS_REPLY_ARRAY ||
+                        reply->elements != 2) {
+                        LOG(ERROR) << "MetaRedis restore: PSCAN failed, "
+                                      "physical shard="
+                                   << p;
+                        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+                    }
+                    cursor.assign(reply->element[0]->str,
+                                  reply->element[0]->len);
+                    redisReply* arr = reply->element[1];
+                    for (size_t i = 0; i < arr->elements; ++i) {
+                        redisReply* k = arr->element[i];
+                        if (k != nullptr && k->str != nullptr) {
+                            hash_keys.emplace(k->str, k->len);
+                        }
+                    }
+                } while (cursor != "0");
+
+                std::vector<StandbyObjectEntry> local;
+                for (const auto& hk : hash_keys) {
+                    if (ParseBucketFromHashKey(hk) < 0) {
+                        LOG(WARNING) << "MetaRedis restore: ignoring "
+                                        "unrecognized key on physical shard "
+                                     << p << ": " << hk;
+                        continue;
+                    }
+                    auto restored = RecoverOneObjectHash(ctx, hk, local);
+                    if (!restored) {
+                        return tl::make_unexpected(restored.error());
+                    }
+                }
+                return local;
+            }();
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    std::vector<StandbyObjectEntry> out;
+    std::optional<ErrorCode> first_error;
+    for (auto& r : results) {
+        if (!r) {
+            if (!first_error) first_error = r.error();
+        } else {
+            for (auto& e : *r) out.push_back(std::move(e));
+        }
+    }
+    if (first_error) {
+        LOG(ERROR) << "MetaRedis restore(PSCAN): aborting, first error="
+                   << static_cast<int>(*first_error);
+        return tl::make_unexpected(*first_error);
+    }
+    LOG(INFO) << "MetaRedis restored " << out.size()
+              << " objects from Redis (concurrent PSCAN, physical shards="
+              << num_pshards << ")";
+    return out;
+}
+
 #else  // STORE_USE_REDIS
 
 // Stubs for builds without hiredis. Writes are no-ops that report success so
@@ -502,6 +693,18 @@ bool MasterMetaRedisStore::PutObjectAndHashes(
 bool MasterMetaRedisStore::PutSegment(const StandbySegmentInfo&) { return true; }
 
 bool MasterMetaRedisStore::DelSegment(std::string_view) { return true; }
+
+tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
+MasterMetaRedisStore::RecoverObjects() {
+    if (!Enabled()) return std::vector<StandbyObjectEntry>{};
+    return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+}
+
+tl::expected<std::vector<StandbySegmentInfo>, ErrorCode>
+MasterMetaRedisStore::RecoverSegments() {
+    if (!Enabled()) return std::vector<StandbySegmentInfo>{};
+    return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+}
 
 #endif  // STORE_USE_REDIS
 

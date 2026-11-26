@@ -1894,6 +1894,31 @@ TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
 
 }  // namespace mooncake::offset_allocator
 
+TEST(OffsetAllocatorRecovery, RebuildFromRegions) {
+    using mooncake::offset_allocator::OffsetAllocator;
+    constexpr uint64_t kSize = 1U << 20;
+    auto a = OffsetAllocator::create(0, kSize, 1024, 1U << 20);
+    auto h1 = a->allocate(4096);
+    auto h2 = a->allocate(8192);
+    ASSERT_TRUE(h1.has_value());
+    ASSERT_TRUE(h2.has_value());
+
+    std::vector<OffsetAllocator::RecoveredRegion> regions{
+        {h1->address(), a->normalizedAllocationSize(4096), 4096},
+        {h2->address(), a->normalizedAllocationSize(8192), 8192}};
+    auto b = OffsetAllocator::create(0, kSize, 1024, 1U << 20);
+    auto rebuilt = b->rebuildFromRegions(regions);
+    ASSERT_TRUE(rebuilt.has_value());
+    ASSERT_EQ(rebuilt->size(), 2u);
+    EXPECT_EQ(rebuilt->at(0).first, h1->address());
+    EXPECT_EQ(rebuilt->at(1).first, h2->address());
+
+    // The rebuilt allocator must still allocate around the recovered regions.
+    auto h3 = b->allocate(4096);
+    ASSERT_TRUE(h3.has_value());
+    EXPECT_LE(h3->address() + h3->size(), kSize);
+}
+
 int main(int argc, char** argv) {
     // Initialize Google Test
     ::testing::InitGoogleTest(&argc, argv);

@@ -202,6 +202,17 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    // Redis is the cross-failover truth for extents. Restore before serving;
+    // corrupt/overlapping data aborts startup rather than serving a partial map.
+    if (redis_enabled_) {
+        auto restore = RestoreFromRedis();
+        if (!restore) {
+            LOG(ERROR) << "DFS allocator failed to restore from Redis, error="
+                       << restore.error();
+            return tl::make_unexpected(restore.error());
+        }
+    }
+
     initialized_.store(true, std::memory_order_release);
     return {};
 }
@@ -1080,6 +1091,147 @@ bool ShardAllocator::DoRedisRemoveAlloc(RedisConn& conn,
     return true;
 }
 #endif
+tl::expected<void, ErrorCode> ShardAllocator::RestoreFromRedis() {
+    if (!redis_enabled_) return {};
+#ifndef STORE_USE_REDIS
+    LOG(ERROR) << "DFS redis restore requested but the build lacks "
+                  "STORE_USE_REDIS";
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    if (redis_pscan_shards_ > 1) {
+        LOG(WARNING) << "DFS redis PSCAN is not implemented in this port; "
+                        "restoring sequentially";
+    }
+    auto conn = ha::common::redis::ConnectRedis(redis_connstring_);
+    if (!conn) {
+        LOG(ERROR) << "DFS redis restore: connect failed";
+        return tl::make_unexpected(conn.error());
+    }
+    redisContext* ctx = conn.value().get();
+
+    uint64_t total_restored = 0;
+    for (int shard_idx = 0; shard_idx < GetShardCount(); ++shard_idx) {
+        auto restored =
+            RestoreOneHash(ctx, shard_idx, ShardHashKey(shard_idx));
+        if (!restored) return tl::make_unexpected(restored.error());
+        total_restored += *restored;
+    }
+    LOG(INFO) << "DFS allocator restored " << total_restored
+              << " allocations from Redis";
+    return {};
+#endif
+}
+
+tl::expected<uint64_t, ErrorCode> ShardAllocator::RestoreOneHash(
+    redisContext* ctx, int shard_idx, const std::string& hash_key) {
+#ifndef STORE_USE_REDIS
+    (void)ctx;
+    (void)shard_idx;
+    (void)hash_key;
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    struct Meta {
+        uint64_t alloc_offset;
+        std::string key;
+        uint64_t reserved_bytes;
+        uint64_t object_size;
+    };
+    const auto* shards = shards_.load(std::memory_order_acquire);
+    auto& shard = *(*shards)[shard_idx];
+
+    std::vector<offset_allocator::OffsetAllocator::RecoveredRegion> regions;
+    std::unordered_map<uint64_t, Meta> by_raw;
+
+    std::string cursor = "0";
+    do {
+        ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
+            redisCommand(ctx, "HSCAN %s %s COUNT 1000", hash_key.c_str(),
+                         cursor.c_str())));
+        if (reply == nullptr || reply->type != REDIS_REPLY_ARRAY ||
+            reply->elements != 2) {
+            LOG(ERROR) << "DFS redis HSCAN failed, key=" << hash_key;
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        cursor.assign(reply->element[0]->str, reply->element[0]->len);
+        redisReply* kv = reply->element[1];
+        for (size_t i = 0; i + 1 < kv->elements; i += 2) {
+            redisReply* f = kv->element[i];
+            redisReply* v = kv->element[i + 1];
+            uint64_t alloc_offset = 0;
+            try {
+                alloc_offset = std::stoull(std::string(f->str, f->len));
+            } catch (const std::exception&) {
+                LOG(ERROR) << "DFS restore: bad field in " << hash_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            DfsAllocRecord dfs_rec;
+            if (struct_pack::deserialize_to(
+                    dfs_rec, std::string_view(v->str, v->len)) !=
+                struct_pack::errc::ok) {
+                LOG(ERROR) << "DFS restore: corrupt value in " << hash_key
+                           << " field=" << alloc_offset;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            const uint64_t raw_offset = dfs_rec.raw_offset;
+            const uint64_t object_size = dfs_rec.object_size;
+            std::string key = std::move(dfs_rec.key);
+            const uint64_t aligned_size = AlignSize(object_size);
+            const uint64_t reserved_bytes =
+                shard.allocator->normalizedAllocationSize(aligned_size);
+            if (reserved_bytes == 0) {
+                LOG(ERROR) << "DFS restore: unrepresentable size in "
+                           << hash_key << " field=" << alloc_offset
+                           << " object_size=" << object_size;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            regions.push_back({raw_offset, reserved_bytes, aligned_size});
+            by_raw[raw_offset] = Meta{alloc_offset, std::move(key),
+                                      reserved_bytes, object_size};
+        }
+    } while (cursor != "0");
+
+    if (regions.empty()) return uint64_t{0};
+
+    auto handles = shard.allocator->rebuildFromRegions(std::move(regions));
+    if (!handles) {
+        LOG(ERROR) << "DFS restore: allocator rebuild failed for shard "
+                   << shard_idx
+                   << " (overlapping/out-of-range regions); refusing to serve";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    uint64_t restored = 0;
+    std::vector<std::pair<std::string, uint64_t>> restored_lru;
+    restored_lru.reserve(handles->size());
+    {
+        std::unique_lock<std::shared_mutex> handle_lock(shard.handle_mutex);
+        for (auto& [raw_offset, handle] : *handles) {
+            auto mit = by_raw.find(raw_offset);
+            if (mit == by_raw.end()) {
+                LOG(ERROR) << "DFS restore: rebuilt handle has no metadata, "
+                           << "shard=" << shard_idx
+                           << " raw_offset=" << raw_offset;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            shard.offset_to_handle[mit->second.alloc_offset] = {
+                mit->second.key,
+                std::make_shared<OffsetAllocationHandle>(std::move(handle)),
+                mit->second.reserved_bytes, mit->second.object_size};
+            restored_lru.emplace_back(mit->second.key,
+                                      mit->second.alloc_offset);
+            ++restored;
+        }
+    }
+    // Restored extents are cold; seed the LRU so eviction can reclaim them.
+    std::lock_guard lru_lock(shard.lru_mutex);
+    for (const auto& [key, offset] : restored_lru) {
+        shard.lru_list.push_back({key, offset});
+        shard.lru_index.emplace(shard.lru_list.back().first,
+                                std::prev(shard.lru_list.end()));
+    }
+    return restored;
+#endif
+}
 
 uint64_t ShardAllocator::AlignSize(uint64_t size) const {
     return (size + alignment_ - 1) & ~(alignment_ - 1);

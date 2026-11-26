@@ -167,6 +167,21 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]] std::optional<OffsetAllocationHandle> createHandleAtNode(
         uint32_t node_index, uint64_t real_offset, uint64_t requested_size);
 
+    // One live allocation recovered from an external store (e.g. Redis after a
+    // master failover). All values are real byte values.
+    struct RecoveredRegion {
+        uint64_t real_offset;
+        uint64_t allocation_size;
+        uint64_t requested_size;
+    };
+
+    // Rebuild a fresh allocator so exactly `regions` are marked used. Returns
+    // handles paired with real_offset for metadata rejoin, or nullopt on
+    // overlapping/misaligned/out-of-range regions.
+    [[nodiscard]] std::optional<
+        std::vector<std::pair<uint64_t, OffsetAllocationHandle>>>
+    rebuildFromRegions(std::vector<RecoveredRegion> regions);
+
     // Returns the actual region size consumed by allocate(size), or zero when
     // the request cannot be represented by this allocator.
     [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const;
@@ -259,6 +274,12 @@ class __Allocator {
     // Serialize the allocator with serializer.
     template <typename T>
     void serialize_to(T& serializer) const;
+
+    // Rebuild the node/bin state so exactly `used_regions` are marked used.
+    // Returns one node index per region, or an empty vector on overlap /
+    // out-of-range input.
+    std::vector<uint32> rebuildFromUsedRegions(
+        const std::vector<std::pair<uint32, uint32>>& used_regions);
 
    private:
     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);

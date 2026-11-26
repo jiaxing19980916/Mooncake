@@ -41,6 +41,9 @@ class WrappedMasterService {
     void MarkReadyForServing();
     void ActivateServing();
     MasterService::RestoreLifecycleState GetRestoreLifecycleState() const;
+    // True when the constructor already rebuilt state from the Redis mirror;
+    // the HA supervisor then skips the standby snapshot restore.
+    bool RedisRecoveryEnabled() const;
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).

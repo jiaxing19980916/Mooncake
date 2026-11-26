@@ -810,8 +810,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
         // This review unit can replay and snapshot obligations but cannot yet
         // resume their Master lifecycle. Never serve after dropping that state.
-        auto restore_result =
-            promotion_ctx->HasObjectReplicaState()
+        // With Redis metadata recovery the per-term MasterService already
+        // rebuilt objects + segments in its constructor; running the standby
+        // restore afterwards would apply an empty/older state on top.
+        tl::expected<void, ErrorCode> restore_result =
+            wrapped_master_service->RedisRecoveryEnabled()
+                ? tl::expected<void, ErrorCode>{}
+            : promotion_ctx->HasObjectReplicaState()
                 ? tl::expected<void, ErrorCode>(
                       tl::unexpected(ErrorCode::NOT_SUPPORTED))
             : promotion_ctx->metadata_store
