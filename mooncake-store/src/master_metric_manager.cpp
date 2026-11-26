@@ -137,6 +137,25 @@ MasterMetricManager::MasterMetricManager()
                         "Total number of PutEnd requests received"),
       put_end_failures_("master_put_end_failures_total",
                         "Total number of failed PutEnd requests"),
+      meta_redis_mirror_total_("master_meta_redis_mirror_total",
+                               "Total object metadata mirror writes"),
+      meta_redis_mirror_fail_total_(
+          "master_meta_redis_mirror_fail_total",
+          "Total object metadata mirror write failures"),
+      meta_redis_write_ahead_rollback_total_(
+          "master_meta_redis_write_ahead_rollback_total",
+          "Total PutEnd commits rolled back after a Redis write failure"),
+      meta_redis_del_total_("master_meta_redis_del_total",
+                            "Total object metadata mirror deletes"),
+      meta_redis_del_fail_total_(
+          "master_meta_redis_del_fail_total",
+          "Total object metadata mirror delete failures"),
+      put_end_object_taken_over_total_(
+          "master_put_end_object_taken_over_total",
+          "PutEnd commits abandoned because another writer took the object over"),
+      put_end_metadata_changed_total_(
+          "master_put_end_metadata_changed_total",
+          "PutEnd mirror writes followed by a metadata resync"),
       put_revoke_requests_("master_put_revoke_requests_total",
                            "Total number of PutRevoke requests received"),
       put_revoke_failures_("master_put_revoke_failures_total",
@@ -2278,6 +2297,13 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_partial_allocations_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
+    serialize_metric(meta_redis_mirror_total_);
+    serialize_metric(meta_redis_mirror_fail_total_);
+    serialize_metric(meta_redis_write_ahead_rollback_total_);
+    serialize_metric(meta_redis_del_total_);
+    serialize_metric(meta_redis_del_fail_total_);
+    serialize_metric(put_end_object_taken_over_total_);
+    serialize_metric(put_end_metadata_changed_total_);
     serialize_metric(put_revoke_requests_);
     serialize_metric(put_revoke_failures_);
     serialize_metric(get_replica_list_requests_);

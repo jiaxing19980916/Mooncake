@@ -76,6 +76,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/leadership/master_service_supervisor.cpp
     shutdown_request.cpp
     ha/kv/etcd_ha_kv_backend.cpp
+    ha/kv/master_meta_redis_store.cpp
     ha/kv/redis_ha_kv_backend.cpp
     ha/kv/ha_kv_backend_factory.cpp
     ha/standby_controller.cpp

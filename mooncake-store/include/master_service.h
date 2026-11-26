@@ -45,6 +45,7 @@
 #include "tenant/quota_policy.h"
 #include "types.h"
 #include "weight_store_manager.h"
+#include "ha/kv/master_meta_redis_store.h"
 #include "master_config.h"
 #include "object_metadata.h"
 #include "object_runtime_state.h"
@@ -1186,7 +1187,9 @@ class MasterService {
 
     void ClearInvalidHandles();
     // Caller owns master_state_mutex_ (shared) while metadata is swept.
-    void ClearInvalidHandlesLocked();
+    // Returns the first Redis mirror error: an entry that could not be
+    // converged keeps its replicas, so a retry can finish the sweep.
+    tl::expected<void, ErrorCode> ClearInvalidHandlesLocked();
     // Clear completed LOCAL_DISK replicas owned by exactly this client during
     // explicit unmount, even if its session still retains resources.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
@@ -1403,6 +1406,13 @@ class MasterService {
     tl::expected<void, ErrorCode> PersistStaleHandleCleanupForHA(
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
+        const StaleHandleCleanupPlan& plan);
+    // Redis mirror counterpart: publishes the post-cleanup committed replica
+    // set (HDEL when it is empty) before the in-memory erase, so a failed
+    // round trip leaves memory untouched and can be retried.
+    tl::expected<void, ErrorCode> PersistStaleHandleCleanupForRedis(
+        const std::string& why, const TenantId& tenant_id,
+        const std::string& key, const ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
     // Removes the object under HA with the oplog on: marks its completed
     // replicas removed and queues a REMOVE whose durable callback drops them,
@@ -2038,6 +2048,13 @@ class MasterService {
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
+    // Redis object-table mirror. Enabled only when
+    // MOONCAKE_ENABLE_REDIS_RECOVERY is on; meta_redis_ is then non-null.
+    bool redis_recovery_enabled_{false};
+    std::unique_ptr<MasterMetaRedisStore> meta_redis_;
+    static constexpr size_t kMetaRedisBuckets = 1024;
+
+
     // Remote HTTP metadata server URL, used when the metadata server is
     // deployed separately. Empty = no remote cleanup (co-located prefers the
     // pointer).
@@ -2318,6 +2335,81 @@ class MasterService {
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
         const ObjectMetadata& metadata,
         const std::vector<Replica::Descriptor>& replicas) const;
+
+    // ---- Redis object-table mirror (MOONCAKE_ENABLE_REDIS_RECOVERY) ----
+    // Construct meta_redis_ from the environment. No-op when the switch is off.
+    void InitMetaRedisFromEnvironment(const MasterServiceConfig& config);
+    // HSET one committed object's metadata. Returns false only on a Redis error
+    // so PutEnd can gate its commit; no-op when the mirror is disabled.
+    bool MirrorObjectToRedis(const TenantId& tenant_id, const std::string& key,
+                             const ObjectMetadata& metadata);
+    // HSET one committed object's metadata from an explicit replica set. The
+    // caller supplies the post-state before mutating in-memory metadata, so a
+    // registration can be gated on Redis. No-op when the mirror is disabled.
+    bool MirrorObjectStateToRedis(
+        const TenantId& tenant_id, const std::string& key,
+        const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& committed);
+    // HDEL one object's mirror entry. Returns false only on a Redis error.
+    bool RemoveObjectFromRedis(const TenantId& tenant_id,
+                               const std::string& key);
+    // HSET/HDEL one memory segment's `<cluster_id>:seg` entry. Return false
+    // only on a Redis error; no-op when the mirror is disabled.
+    bool MirrorSegmentToRedis(const Segment& segment);
+    bool RemoveSegmentFromRedis(std::string_view transport_endpoint);
+    // Write-ahead delete gate: HDEL before mutating in-memory state.
+    bool RedisHDelGate(const TenantId& tenant_id, const std::string& key);
+    // HDEL the mirror, then erase the object metadata. Returns false on a Redis
+    // error without touching memory; no-op when the mirror is disabled.
+    bool EraseObjectWithRedisGate(MetadataAccessorRW& accessor,
+                                  const TenantId& tenant_id,
+                                  const std::string& key);
+    // Converge the mirror on the current committed replica set after a
+    // revalidation failure. The caller already fails the operation.
+    void ResyncObjectToRedis(const TenantId& tenant_id,
+                             const std::string& key,
+                             const ObjectMetadata& metadata);
+    // Stable Redis hash bucket for one object. The bucket does not affect
+    // correctness (the field carries the tenant and key), only distribution.
+    size_t MetaRedisBucket(const TenantId& tenant_id,
+                           const std::string& key) const;
+
+    // Compact identity of the mirrored state, used to detect that in-memory
+    // metadata changed while the Redis write ran without the key lock.
+    struct MirrorFingerprint {
+        uint64_t lo{0};
+        uint64_t hi{0};
+        bool operator==(const MirrorFingerprint& other) const {
+            return lo == other.lo && hi == other.hi;
+        }
+    };
+    MirrorFingerprint FingerprintMetadata(const ObjectMetadata& metadata) const;
+
+    // PutEnd split: Redis disabled uses the original single-lock path,
+    // Redis enabled uses the memory-first mirror path.
+    auto PutEndOriginal(const UUID& client_id, const ObjectMeta& object_meta,
+                        const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+    auto PutEndMirrorRedis(const UUID& client_id,
+                           const ObjectMeta& object_meta,
+                           const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+    bool IsPutEndTargetReplica(const Replica& replica,
+                               ReplicaType replica_type) const;
+    // Shared validation: returns false when this is a completed retry that
+    // should be a no-op, and an error for missing/foreign/non-processing.
+    tl::expected<bool, ErrorCode> PreparePutEndLocked(
+        MetadataAccessorRW& accessor, const UUID& client_id,
+        const std::string& key, ReplicaType replica_type);
+    // Side effects after the committed replica set is final (and, on the
+    // mirrored path, after Redis holds it).
+    auto FinishPutEndLocked(
+        MetadataAccessorRW& accessor, const ObjectMeta& object_meta,
+        const TenantId& tenant_id, ReplicaType replica_type,
+        WeightStoreManager::ImportWriteGuard& import_write,
+        bool had_completed_replica, bool advanced_primary_write,
+        bool completed_pending_replica) -> tl::expected<void, ErrorCode>;
+
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend,
                                          bool require_fenced_writer);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(

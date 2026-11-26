@@ -170,6 +170,29 @@ class MasterMetricManager {
     void inc_client_offboarding_alert();
     void observe_client_offboarding_duration_ms(int64_t duration_ms);
 
+    // Redis object-table mirror (MOONCAKE_ENABLE_REDIS_RECOVERY).
+    void inc_meta_redis_mirror(int64_t val = 1) {
+        meta_redis_mirror_total_.inc(val);
+    }
+    void inc_meta_redis_mirror_fail(int64_t val = 1) {
+        meta_redis_mirror_fail_total_.inc(val);
+    }
+    void inc_meta_redis_write_ahead_rollback(int64_t val = 1) {
+        meta_redis_write_ahead_rollback_total_.inc(val);
+    }
+    void inc_meta_redis_del(int64_t val = 1) {
+        meta_redis_del_total_.inc(val);
+    }
+    void inc_meta_redis_del_fail(int64_t val = 1) {
+        meta_redis_del_fail_total_.inc(val);
+    }
+    void inc_put_end_object_taken_over(int64_t val = 1) {
+        put_end_object_taken_over_total_.inc(val);
+    }
+    void inc_put_end_metadata_changed(int64_t val = 1) {
+        put_end_metadata_changed_total_.inc(val);
+    }
+
     // Operation Statistics (Counters)
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
@@ -670,6 +693,14 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_partial_allocations_;
     ylt::metric::counter_t put_end_requests_;
     ylt::metric::counter_t put_end_failures_;
+    // Redis object-table mirror.
+    ylt::metric::counter_t meta_redis_mirror_total_;
+    ylt::metric::counter_t meta_redis_mirror_fail_total_;
+    ylt::metric::counter_t meta_redis_write_ahead_rollback_total_;
+    ylt::metric::counter_t meta_redis_del_total_;
+    ylt::metric::counter_t meta_redis_del_fail_total_;
+    ylt::metric::counter_t put_end_object_taken_over_total_;
+    ylt::metric::counter_t put_end_metadata_changed_total_;
     ylt::metric::counter_t put_revoke_requests_;
     ylt::metric::counter_t put_revoke_failures_;
     ylt::metric::counter_t get_replica_list_requests_;

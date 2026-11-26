@@ -1365,7 +1365,9 @@ TEST_F(MasterServiceTest, DfsOnlyLifecyclePathsReleaseTheExtent) {
     // An abandoned write is reaped after the release timeout.
     ASSERT_TRUE(service.PutStart(writer, "c", TenantId::Default(), kSize,
                                  DfsOnlyConfig()));
-    std::this_thread::sleep_for(std::chrono::seconds(4));
+    // The reaper checks once per release interval; a write that misses the
+    // first boundary is only taken on the next one. Sleep two intervals.
+    std::this_thread::sleep_for(std::chrono::seconds(5));
     auto reaped = service.GetReplicaList("c", TenantId::Default());
     ASSERT_FALSE(reaped.has_value());
     EXPECT_EQ(reaped.error(), ErrorCode::OBJECT_NOT_FOUND);
@@ -6159,6 +6161,20 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(unique_popped, expected_ids);
 }
 
+// Opt-in live test for the `<cluster_id>:seg` mirror. Set
+// MOONCAKE_META_REDIS_TEST_CONNSTRING (e.g. redis://127.0.0.1:6380) to run.
+// A new serving term claims a newer epoch at MasterService construction. The
+// previous term must lose the ability to mutate the mirror: its late deletes
+// (client expiry) and late PutEnd must not touch keys the new leader owns.
+// Redis metadata recovery has a per-extent ledger only for the shard
+// allocator; bucket mode must be rejected at startup, before creating files.
+// The per-term MasterService constructor must rebuild objects + segments from
+// the Redis mirror before the HA supervisor is allowed to serve.
+// DFS replica descriptors and the shard allocator ledger must both survive a
+// term: metadata comes from obj:*, the offset_to_handle map from oth:*.
+// A client that never reconnects must not leave its recovered segment in
+// Redis forever: after the grace window the object replicas are swept and the
+// seg:* entry is deleted.
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

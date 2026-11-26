@@ -92,6 +92,27 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     return lhs * rhs;
 }
 
+bool GetEnvBool(const char* name, bool fallback) {
+    const auto value = Environ::Process().Get(name);
+    if (!value.has_value()) return fallback;
+    return *value == "1" || *value == "true" || *value == "TRUE" ||
+           *value == "on" || *value == "yes";
+}
+
+int GetEnvInt(const char* name, int fallback) {
+    const auto value = Environ::Process().Get(name);
+    if (!value.has_value()) return fallback;
+    try {
+        return std::stoi(*value);
+    } catch (const std::exception&) {
+        return fallback;
+    }
+}
+
+std::string GetEnvString(const char* name) {
+    return Environ::Process().Get(name).value_or(std::string{});
+}
+
 // Decides whether PutStart may proceed with the replicas that were
 // actually allocated. Three deliberately different policies apply:
 //
@@ -241,10 +262,24 @@ struct MasterService::MemoryEviction {
         bool SupportsParallel() const override { return true; }
 
         tl::expected<eviction::Effect, ErrorCode> Apply(
-            metadata::Namespace&, const route::WriteGuard& hold,
+            metadata::Namespace& ns, const route::WriteGuard& hold,
             const eviction::Plan& plan, const eviction::Report&) override {
             ObjectMetadata& metadata = hold.metadata();
             eviction::Effect effect;
+
+            // Write-ahead the post-eviction committed set before releasing
+            // memory. Redis and OpLog are mutually exclusive at startup.
+            if (service_.meta_redis_ && service_.meta_redis_->Enabled()) {
+                auto remaining = service_.BuildRemainingReplicaDescriptors(
+                    metadata, [&plan](const Replica& replica) {
+                        return InPlan(plan, replica);
+                    });
+                if (!service_.MirrorObjectStateToRedis(ns.id(), hold.key(),
+                                                       metadata, remaining)) {
+                    return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+                }
+            }
+
             effect.detached = service_.PopReplicasWithCacheTotalAccounting(
                 metadata, [&plan](const Replica& replica) {
                     return InPlan(plan, replica);
@@ -710,6 +745,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    InitMetaRedisFromEnvironment(config);
     InitDfsAllocatorFromEnvironment(config);
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
@@ -846,7 +882,7 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
-    const auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    auto dfs_config = DistributedStorageConfig::FromEnvironment();
     // KVCS is an object-storage backend and does not use the filesystem DFS
     // allocator, but it still enables the distributed-storage path.
     enable_dfs_ =
@@ -949,6 +985,243 @@ void MasterService::InitDfsAllocatorFromEnvironment(
                       ? ", ready_shard_count=" +
                             std::to_string(shard_allocator_->GetShardCount())
                       : "");
+}
+
+void MasterService::InitMetaRedisFromEnvironment(
+    const MasterServiceConfig& config) {
+    redis_recovery_enabled_ =
+        GetEnvBool("MOONCAKE_ENABLE_REDIS_RECOVERY", false);
+    if (!redis_recovery_enabled_) {
+        LOG(INFO) << "Meta redis DISABLED (MOONCAKE_ENABLE_REDIS_RECOVERY off); "
+                     "object metadata is not mirrored";
+        return;
+    }
+    if (config.enable_oplog || config.enable_oplog_snapshot || enable_oplog_) {
+        LOG(FATAL) << "MOONCAKE_ENABLE_REDIS_RECOVERY cannot be enabled with "
+                      "oplog recovery (enable_oplog="
+                   << config.enable_oplog
+                   << ", enable_oplog_snapshot=" << config.enable_oplog_snapshot
+                   << ", resolved_enable_oplog=" << enable_oplog_
+                   << "); disable one of them";
+    }
+
+    MasterMetaRedisStore::Config cfg;
+    cfg.connstring = GetEnvString("MOONCAKE_META_REDIS_CONNSTRING");
+    cfg.ns = cluster_id_;
+    cfg.write_conns = GetEnvInt("MOONCAKE_META_REDIS_WRITE_CONNS", 0);
+    {
+        const int chunk_raw =
+            GetEnvInt("MOONCAKE_META_REDIS_HDEL_CHUNK_FIELDS", 256);
+        const int chunk = std::clamp(chunk_raw, 16, 8192);
+        cfg.hdel_chunk_fields = static_cast<size_t>(chunk);
+    }
+    cfg.num_buckets = kMetaRedisBuckets;
+    if (cfg.connstring.empty()) {
+        LOG(FATAL) << "MOONCAKE_META_REDIS_CONNSTRING must be set when "
+                      "MOONCAKE_ENABLE_REDIS_RECOVERY is enabled";
+    }
+    if (cluster_id_.empty()) {
+        LOG(WARNING) << "Meta redis enabled with an empty cluster_id; obj keys "
+                        "will not be namespaced, risking collisions";
+    }
+    LOG(INFO) << "Meta redis ENABLED: namespace=" << cluster_id_
+              << ", write_conns=" << cfg.write_conns;
+    meta_redis_ = std::make_unique<MasterMetaRedisStore>(std::move(cfg));
+}
+
+
+size_t MasterService::MetaRedisBucket(const TenantId& tenant_id,
+                                      const std::string& key) const {
+    // Deterministic across processes: a restart must route the same key to the
+    // same hash, or a stale entry would survive in the old bucket.
+    const std::string scoped = tenant_id.value() + std::string("\x1f") + key;
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char c : scoped) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ULL;
+    }
+    return static_cast<size_t>(hash % kMetaRedisBuckets);
+}
+
+bool MasterService::MirrorObjectToRedis(const TenantId& tenant_id,
+                                        const std::string& key,
+                                        const ObjectMetadata& metadata) {
+    std::vector<Replica::Descriptor> committed;
+    committed.reserve(metadata.GetAllReplicas().size());
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        if (replica.status() == ReplicaStatus::COMPLETE) {
+            committed.push_back(replica.get_descriptor());
+        }
+    }
+    return MirrorObjectStateToRedis(tenant_id, key, metadata, committed);
+}
+
+bool MasterService::MirrorObjectStateToRedis(
+    const TenantId& tenant_id, const std::string& key,
+    const ObjectMetadata& metadata,
+    const std::vector<Replica::Descriptor>& committed) {
+    if (!meta_redis_ || !meta_redis_->Enabled()) return true;
+    if (committed.empty()) {
+        MasterMetricManager::instance().inc_meta_redis_del();
+        const bool ok = meta_redis_->DelObject(
+            MetaRedisBucket(tenant_id, key), tenant_id.value(), key);
+        if (!ok) MasterMetricManager::instance().inc_meta_redis_del_fail();
+        return ok;
+    }
+    MasterMetricManager::instance().inc_meta_redis_mirror();
+    const bool ok = meta_redis_->PutObject(
+        MetaRedisBucket(tenant_id, key), tenant_id.value(), key,
+        SerializeMetadataForOpLogFromReplicaDescriptors(metadata, committed));
+    if (!ok) MasterMetricManager::instance().inc_meta_redis_mirror_fail();
+    return ok;
+}
+
+bool MasterService::RemoveObjectFromRedis(const TenantId& tenant_id,
+                                          const std::string& key) {
+    if (!meta_redis_ || !meta_redis_->Enabled()) return true;
+    MasterMetricManager::instance().inc_meta_redis_del();
+    const bool ok = meta_redis_->DelObject(
+        MetaRedisBucket(tenant_id, key), tenant_id.value(), key);
+    if (!ok) MasterMetricManager::instance().inc_meta_redis_del_fail();
+    return ok;
+}
+
+bool MasterService::MirrorSegmentToRedis(const Segment& segment) {
+    if (!meta_redis_ || !meta_redis_->Enabled()) return true;
+    if (segment.te_endpoint.empty()) {
+        LOG(ERROR) << "Refusing to mirror segment without a transport "
+                      "endpoint, segment_name="
+                   << segment.name;
+        return false;
+    }
+    StandbySegmentInfo info;
+    info.segment_name = segment.name;
+    info.transport_endpoint = segment.te_endpoint;
+    info.capacity = segment.size;
+    info.is_memory_segment = true;
+    if (!meta_redis_->PutSegment(info)) {
+        LOG(ERROR) << "MetaRedis PutSegment failed, segment_name="
+                   << segment.name << ", endpoint=" << segment.te_endpoint;
+        return false;
+    }
+    return true;
+}
+
+bool MasterService::RemoveSegmentFromRedis(std::string_view transport_endpoint) {
+    if (!meta_redis_ || !meta_redis_->Enabled()) return true;
+    if (transport_endpoint.empty()) return true;
+    if (!meta_redis_->DelSegment(transport_endpoint)) {
+        LOG(ERROR) << "MetaRedis DelSegment failed, endpoint="
+                   << transport_endpoint;
+        return false;
+    }
+    return true;
+}
+
+bool MasterService::RedisHDelGate(const TenantId& tenant_id,
+                                 const std::string& key) {
+    if (RemoveObjectFromRedis(tenant_id, key)) return true;
+    LOG(ERROR) << "Redis HDEL gate failed for key=" << key
+               << ", aborting delete to avoid Redis/in-memory divergence";
+    return false;
+}
+
+bool MasterService::EraseObjectWithRedisGate(MetadataAccessorRW& accessor,
+                                             const TenantId& tenant_id,
+                                             const std::string& key) {
+    if (!RedisHDelGate(tenant_id, key)) return false;
+    accessor.Erase();
+    return true;
+}
+
+void MasterService::ResyncObjectToRedis(const TenantId& tenant_id,
+                                       const std::string& key,
+                                       const ObjectMetadata& metadata) {
+    if (!meta_redis_ || !meta_redis_->Enabled()) return;
+    if (MirrorObjectToRedis(tenant_id, key, metadata)) return;
+    // The caller is already failing its operation; this only converges a
+    // mirror that no longer describes memory.
+    LOG(WARNING) << "Redis re-mirror failed for key=" << key
+                 << ", mirror is stale until the next write or recovery";
+}
+
+MasterService::MirrorFingerprint MasterService::FingerprintMetadata(
+    const ObjectMetadata& metadata) const {
+    // Two FNV-1a accumulators over the serialized-equivalent state, minus the
+    // lease. The eviction/put paths compare this across an unlocked Redis write.
+    constexpr uint64_t kPrime = 1099511628211ULL;
+    uint64_t lo = 1469598103934665603ULL;
+    uint64_t hi = 14695981039346656037ULL;
+    auto mix = [&](uint64_t value) {
+        lo = (lo ^ value) * kPrime;
+        hi = (hi ^ (value + 0x9e3779b97f4a7c15ULL)) * kPrime;
+        hi ^= hi >> 31;
+    };
+    auto mix_str = [&](const std::string& text) {
+        mix(text.size());
+        size_t i = 0;
+        for (; i + sizeof(uint64_t) <= text.size(); i += sizeof(uint64_t)) {
+            uint64_t word = 0;
+            std::memcpy(&word, text.data() + i, sizeof(word));
+            mix(word);
+        }
+        uint64_t tail = 0;
+        for (size_t k = i; k < text.size(); ++k) {
+            tail |= static_cast<uint64_t>(
+                        static_cast<unsigned char>(text[k]))
+                    << (8 * (k - i));
+        }
+        if (i < text.size()) mix(tail);
+    };
+
+    mix(metadata.TotalLength());
+    mix(static_cast<uint64_t>(metadata.data_type));
+    mix(metadata.IsHardPinned() ? 1ULL : 0ULL);
+    mix(metadata.client_id.first);
+    mix(metadata.client_id.second);
+    mix_str(metadata.group_id);
+    mix_str(metadata.session_id);
+    mix_str(metadata.residency_affinity_id);
+    const auto checksum = metadata.GetPart(0).checksum();
+    mix(checksum.has_value() ? 1ULL : 0ULL);
+    if (checksum.has_value()) mix(*checksum);
+    const auto replicas = metadata.GetAllReplicas();
+    mix(replicas.size());
+    auto mix_buffer = [&](const AllocatedBuffer::Descriptor& buffer) {
+        mix(buffer.size_);
+        mix(static_cast<uint64_t>(buffer.buffer_address_));
+        mix_str(buffer.protocol_);
+        mix_str(buffer.transport_endpoint_);
+    };
+    for (const auto& replica : replicas) {
+        mix(replica.id());
+        mix(static_cast<uint64_t>(replica.type()));
+        mix(static_cast<uint64_t>(replica.status()));
+        mix(replica.get_refcnt());
+        const Replica::Descriptor desc = replica.get_descriptor();
+        if (desc.is_memory_replica()) {
+            mix_buffer(desc.get_memory_descriptor().buffer_descriptor);
+        } else if (desc.is_nof_replica()) {
+            mix_buffer(desc.get_nof_descriptor().buffer_descriptor);
+        } else if (desc.is_dfs_replica()) {
+            const auto& d = desc.get_dfs_descriptor();
+            mix(d.offset);
+            mix(static_cast<uint64_t>(d.shard_idx));
+            mix(d.object_size);
+            mix_str(d.file_path);
+        } else if (desc.is_disk_replica()) {
+            const auto& d = desc.get_disk_descriptor();
+            mix(d.object_size);
+            mix_str(d.file_path);
+        } else {
+            const auto& d = desc.get_local_disk_descriptor();
+            mix(d.client_id.first);
+            mix(d.client_id.second);
+            mix(d.object_size);
+            mix_str(d.transport_endpoint);
+        }
+    }
+    return {.lo = lo, .hi = hi};
 }
 
 MasterService::~MasterService() {
@@ -1139,6 +1412,15 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         registration->Commit();
     }
 
+    // Mirror the segment before reporting success. The shared lock is kept
+    // (see METADATA_UPDATE_PATHS.md): a concurrent write may already have
+    // published an object on this segment, so a failed mirror does not roll
+    // the mount back -- the client retries and the idempotent mount heals
+    // Redis.
+    if (!MirrorSegmentToRedis(segment)) {
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
     if (mount_result == ErrorCode::OK && reservation) {
         auto persisted = PersistSegmentOpForHA("MountSegment",
                                                std::move(*reservation), *entry);
@@ -1250,6 +1532,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         if (!remount->NeedsRemount()) {
             LOG(WARNING) << "client_id=" << client_id
                          << ", warn=client_already_remounted";
+            // Still converge the segment mirror: a retry after a failed HSET
+            // lands here and must not skip it.
+            for (const auto& segment : segments) {
+                if (!MirrorSegmentToRedis(segment)) {
+                    return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+                }
+            }
             // Return OK because this is an idempotent operation
             remount->Commit();
             return {};
@@ -1515,6 +1804,14 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             if (accessor.IsPublished()) {
                 accessor.Get().GrantReadLease(
                     std::chrono::milliseconds(default_kv_lease_ttl_));
+            }
+        }
+        // Publish the authoritative segment records after the repair. The
+        // common restart keeps the same endpoint; object descriptors whose
+        // endpoint did change are mirrored in a follow-up step.
+        for (const auto& restore : restores) {
+            if (!MirrorSegmentToRedis(restore.segment)) {
+                return fail_remount(ErrorCode::PERSISTENT_FAIL);
             }
         }
         remount->Commit();
@@ -2120,6 +2417,44 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
+tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForRedis(
+    const std::string& why, const TenantId& tenant_id, const std::string& key,
+    const ObjectMetadata& metadata, const StaleHandleCleanupPlan& plan) {
+    if (plan.removed_ids.empty()) {
+        return {};
+    }
+    if (!meta_redis_ || !meta_redis_->Enabled()) {
+        return {};
+    }
+
+    // Publish the post-cleanup state before the replicas are erased: a Redis
+    // error must leave memory untouched, so the sweep can be retried instead
+    // of diverging. PROCESSING replicas are not mirrored, and a completed
+    // memory replica whose allocator is gone has no usable transport
+    // endpoint, so neither may be serialized.
+    const std::unordered_set<ReplicaID> ids(plan.removed_ids.begin(),
+                                            plan.removed_ids.end());
+    std::vector<Replica::Descriptor> remaining;
+    remaining.reserve(metadata.GetAllReplicas().size());
+    for (const auto& replica : metadata.GetAllReplicas()) {
+        if (ids.contains(replica.id()) ||
+            replica.status() != ReplicaStatus::COMPLETE) {
+            continue;
+        }
+        if (replica.is_memory_replica() && replica.has_invalid_mem_handle()) {
+            continue;
+        }
+        remaining.push_back(replica.get_descriptor());
+    }
+    if (!MirrorObjectStateToRedis(tenant_id, key, metadata, remaining)) {
+        LOG(ERROR) << why << ": Redis mirror failed for key=" << key
+                   << ", aborting stale-handle cleanup to avoid "
+                      "Redis/in-memory divergence";
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    return {};
+}
+
 void MasterService::VisitNamespaces(
     const std::function<void(const TenantId&, metadata::Namespace&)>& visit)
     const {
@@ -2137,6 +2472,18 @@ void MasterService::CleanupInvalidMemoryReplicas(MetadataAccessorRW& accessor) {
         return;
     }
     ObjectMetadata& metadata = accessor.Get();
+    // These completed replicas are part of the object's published set, so the
+    // mirror must be converged before they are dropped. On a Redis error the
+    // stale handles stay put and a later access retries.
+    const auto cleanup_plan = BuildStaleHandleCleanupPlan(
+        metadata,
+        [](const Replica& replica) { return replica.has_invalid_mem_handle(); });
+    if (!cleanup_plan.removed_ids.empty() &&
+        !PersistStaleHandleCleanupForRedis(
+            "CleanupInvalidMemoryReplicas", accessor.GetTenantId(),
+            accessor.GetKey(), metadata, cleanup_plan)) {
+        return;
+    }
     // Erase invalid memory replicas (those with unmounted segments).
     std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(
@@ -2461,11 +2808,11 @@ void MasterService::OnClientSessionChanged(const ClientSessionEvent& event) {
 
 void MasterService::ClearInvalidHandles() {
     std::shared_lock<std::shared_mutex> snapshot_lock(master_state_mutex_);
-    ClearInvalidHandlesLocked();
+    (void)ClearInvalidHandlesLocked();
 }
 
-void MasterService::ClearInvalidHandlesLocked() {
-    (void)ClearStaleHandles([](const Replica& replica) {
+tl::expected<void, ErrorCode> MasterService::ClearInvalidHandlesLocked() {
+    return ClearStaleHandles([](const Replica& replica) {
         return (replica.has_invalid_mem_handle() ||
                 replica.has_invalid_nof_handle() ||
                 replica.has_stale_local_disk_client()) &&
@@ -2514,6 +2861,15 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                         cleanup_plan);
                     if (!persist_result && !first_persist_error) {
                         first_persist_error = persist_result.error();
+                    }
+                    continue;
+                }
+                auto redis_result = PersistStaleHandleCleanupForRedis(
+                    "ClearStaleHandles", tenant_id, object.key, metadata,
+                    cleanup_plan);
+                if (!redis_result) {
+                    if (!first_persist_error) {
+                        first_persist_error = redis_result.error();
                     }
                     continue;
                 }
@@ -2702,6 +3058,19 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                 }
             }
 
+            // Delete the segment mirror only after the object replicas were
+            // swept above and the segment is committed. On failure the entry
+            // stays in the job, so the retry reaches this HDEL again (the
+            // commit above is idempotent for a missing segment).
+            if (!RemoveSegmentFromRedis(it->transport_endpoint)) {
+                LOG(ERROR) << "client_id=" << job.client_id
+                           << ", segment_name=" << it->segment_name
+                           << ", action=unmount_offline_mem_segment"
+                           << ", error=PERSISTENT_FAIL";
+                ++it;
+                continue;
+            }
+
             cleanupHttpMetadata(it->segment_name);
             segment_access.ReleaseUnmountedSegmentName(it->segment_id,
                                                        it->segment_name);
@@ -2792,15 +3161,29 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         reservation.emplace(std::move(reserved.value()));
     }
     size_t metrics_dec_capacity = 0;  // to update the metrics
+    const bool redis_mode = meta_redis_ && meta_redis_->Enabled();
+    Segment segment;
+    bool already_prepared = false;
 
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
     {
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
-        Segment segment;
         if (!segment_access.GetSegment(segment_id, segment)) {
             return {};  // Unmount is idempotent for a missing segment.
+        }
+        if (redis_mode) {
+            // Resume a retry whose previous attempt prepared the allocator but
+            // failed to HDEL the segment mirror: the segment is left
+            // UNMOUNTING so this caller can finish the Redis side.
+            SegmentStatus status = SegmentStatus::UNDEFINED;
+            if (segment_access.GetSegmentStatusByName(segment.name, status) ==
+                    ErrorCode::OK &&
+                status == SegmentStatus::UNMOUNTING) {
+                already_prepared = true;
+                metrics_dec_capacity = segment.size;
+            }
         }
         if (reservation && !segment.te_endpoint.empty()) {
             SegmentUnmountOp op{segment.te_endpoint};
@@ -2816,14 +3199,22 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
-        ErrorCode err = segment_access.PrepareUnmountSegment(
-            segment_id, metrics_dec_capacity);
-        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-            // Return OK because this is an idempotent operation
-            return {};
-        }
-        if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
+        if (!already_prepared) {
+            ErrorCode err = segment_access.PrepareUnmountSegment(
+                segment_id, metrics_dec_capacity);
+            if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+                // Return OK because this is an idempotent operation
+                return {};
+            }
+            if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS &&
+                redis_mode) {
+                // Another caller started preparing between the status read and
+                // the prepare; finish the shared teardown.
+                already_prepared = true;
+                metrics_dec_capacity = segment.size;
+            } else if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
         }
     }
 
@@ -2831,10 +3222,27 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     // reservation must not consume the slot needed by the cleanup's REMOVE.
     // Invalidating the allocator already makes these replicas unreadable.
     if (!entry) {
-        if (enable_async_segment_cleanup_) {
+        if (redis_mode) {
+            // Synchronous: the segment mirror is deleted while the segment is
+            // still in memory, so an HDEL failure is retryable. Objects that
+            // keep a replica are cleaned on the next access or dropped on
+            // recovery once the segment is absent.
+            const auto cleanup = ClearInvalidHandlesLocked();
+            if (!cleanup) {
+                LOG(ERROR) << "UnmountSegment: object mirror cleanup failed, "
+                              "segment_name="
+                           << segment.name
+                           << ", error=" << static_cast<int>(cleanup.error())
+                           << ", continuing with the segment removal";
+            }
+            if (!RemoveSegmentFromRedis(segment.te_endpoint)) {
+                // Leave the segment UNMOUNTING; the retry resumes above.
+                return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+            }
+        } else if (enable_async_segment_cleanup_) {
             replica_cleanup_worker_.Schedule();
         } else {
-            ClearInvalidHandlesLocked();
+            (void)ClearInvalidHandlesLocked();
         }
     }
 
@@ -2844,7 +3252,8 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
             segment_manager_.getSegmentAccess();
         auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
                                                        metrics_dec_capacity);
-        if (err != ErrorCode::OK) {
+        if (err != ErrorCode::OK &&
+            !(redis_mode && err == ErrorCode::SEGMENT_NOT_FOUND)) {
             return tl::make_unexpected(err);
         }
     }
@@ -2926,7 +3335,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
        // deadlocks
 
     // 2. Remove the metadata of the related objects
-    ClearInvalidHandlesLocked();
+    (void)ClearInvalidHandlesLocked();
 
     // 3. Commit the unmount operation
     ScopedNoFSegmentAccess segment_access =
@@ -3494,7 +3903,8 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     ctx.owners.FindOrCreate(local_disk_desc.client_id)));
             } else if (desc.is_dfs_replica()) {
                 const auto& dfs_desc = desc.get_dfs_descriptor();
-                if (!use_kvcs_ || dfs_desc.object_size != standby_meta.size) {
+                if (!use_kvcs_ ||
+                    dfs_desc.object_size != standby_meta.size) {
                     NoteLegacyStandbyRejection(ctx, entry,
                                                "invalid_dfs_descriptor");
                     construction_ok = false;
@@ -4478,7 +4888,9 @@ auto MasterService::BatchReplicaClear(
             }
 
             // Erase the entire metadata (all replicas will be deallocated)
-            accessor.Erase();
+            if (!EraseObjectWithRedisGate(accessor, normalized_tenant, key)) {
+                continue;
+            }
             cleared_keys.emplace_back(key);
             VLOG(1) << "BatchReplicaClear: tenant=" << normalized_tenant
                     << " successfully cleared all replicas for key=" << key
@@ -4562,11 +4974,27 @@ auto MasterService::BatchReplicaClear(
                 }
             }
 
+            bool mirrored_delete = false;
+            if (meta_redis_ && meta_redis_->Enabled()) {
+                auto remaining = BuildRemainingReplicaDescriptors(
+                    metadata, match_replica_on_segment);
+                mirrored_delete = remaining.empty();
+                if (!MirrorObjectStateToRedis(normalized_tenant, key, metadata,
+                                              remaining)) {
+                    continue;
+                }
+            }
+
             EraseReplicasWithCacheTotalAccounting(metadata,
                                                   match_replica_on_segment);
 
             // If no valid replicas remain, erase the entire metadata
             if (!metadata.IsValid()) {
+                if (!mirrored_delete && meta_redis_ && meta_redis_->Enabled()) {
+                    // The remaining set unexpectedly emptied; converge the
+                    // mirror on absent after the in-memory erase.
+                    RemoveObjectFromRedis(normalized_tenant, key);
+                }
                 accessor.Erase();
             }
 
@@ -5310,6 +5738,13 @@ auto MasterService::CleanupStaleBeforeWrite(const char* why,
     if (!persist_result) {
         return tl::make_unexpected(persist_result.error());
     }
+    // The write may not proceed on a mirror that still lists the replicas this
+    // pass is about to drop, so a Redis failure fails the write.
+    auto redis_result = PersistStaleHandleCleanupForRedis(
+        why, tenant_id, key, metadata, cleanup_plan);
+    if (!redis_result) {
+        return tl::make_unexpected(redis_result.error());
+    }
     if (enable_oplog_) {
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
@@ -5436,6 +5871,17 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    if (!meta_redis_ || !meta_redis_->Enabled()) {
+        return PutEndOriginal(client_id, object_meta, tenant_id, replica_type);
+    }
+    return PutEndMirrorRedis(client_id, object_meta, tenant_id, replica_type);
+}
+
+auto MasterService::PutEndOriginal(const UUID& client_id,
+                                   const ObjectMeta& object_meta,
+                                   const TenantId& tenant_id,
+                                   ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -5503,6 +5949,13 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(import_write.error());
     }
 
+    const bool had_completed_replica =
+        metadata.HasReplica(&Replica::fn_is_completed);
+    const bool advanced_primary_write =
+        metadata.HasReplica([&is_target_replica](const Replica& replica) {
+            return replica.is_processing() && is_target_replica(replica);
+        });
+
     if (bucket_allocator_ != nullptr && (replica_type == ReplicaType::ALL ||
                                          replica_type == ReplicaType::DFS)) {
         std::vector<DistributedFSDescriptor> pending_descriptors;
@@ -5523,12 +5976,6 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
 
-    const bool had_completed_replica =
-        metadata.HasReplica(&Replica::fn_is_completed);
-    const bool advanced_primary_write =
-        metadata.HasReplica([&is_target_replica](const Replica& replica) {
-            return replica.is_processing() && is_target_replica(replica);
-        });
     bool completed_pending_replica = false;
     metadata.VisitReplicas(
         [&is_target_replica](const Replica& replica) {
@@ -5546,6 +5993,77 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 dfs_allocator_->UpdateAccess(key, desc);
             }
         });
+
+    return FinishPutEndLocked(accessor, object_meta, tenant_id, replica_type,
+                              import_write.value(), had_completed_replica,
+                              advanced_primary_write,
+                              completed_pending_replica);
+}
+
+bool MasterService::IsPutEndTargetReplica(const Replica& replica,
+                                          ReplicaType replica_type) const {
+    if (replica_type == ReplicaType::ALL) {
+        return (replica.is_memory_replica() &&
+                !replica.has_invalid_mem_handle()) ||
+               (replica.is_nof_replica() &&
+                !replica.has_invalid_nof_handle()) ||
+               replica.is_dfs_replica();
+    }
+    if (replica_type == ReplicaType::MEMORY) {
+        return replica.is_memory_replica() &&
+               !replica.has_invalid_mem_handle();
+    }
+    if (replica_type == ReplicaType::NOF_SSD) {
+        return replica.is_nof_replica() &&
+               !replica.has_invalid_nof_handle();
+    }
+    return replica.type() == replica_type;
+}
+
+tl::expected<bool, ErrorCode> MasterService::PreparePutEndLocked(
+    MetadataAccessorRW& accessor, const UUID& client_id,
+    const std::string& key, ReplicaType replica_type) {
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "PutEnd, key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    if (client_id != metadata.client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
+                   << ", was PutStart-ed by " << metadata.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+    if (!accessor.InProcessing()) {
+        bool has_target_replica = false;
+        bool all_target_replicas_complete = true;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (!IsPutEndTargetReplica(replica, replica_type)) {
+                continue;
+            }
+            has_target_replica = true;
+            if (!replica.is_completed()) {
+                all_target_replicas_complete = false;
+                break;
+            }
+        }
+        if (has_target_replica && all_target_replicas_complete) {
+            return false;
+        }
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    return true;
+}
+
+auto MasterService::FinishPutEndLocked(
+    MetadataAccessorRW& accessor, const ObjectMeta& object_meta,
+    const TenantId& tenant_id, ReplicaType replica_type,
+    WeightStoreManager::ImportWriteGuard& import_write,
+    bool had_completed_replica, bool advanced_primary_write,
+    bool completed_pending_replica) -> tl::expected<void, ErrorCode> {
+    const auto& key = object_meta.key;
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    auto& metadata = accessor.Get();
 
     if (!had_completed_replica && completed_pending_replica &&
         metadata.HasReplica(&Replica::fn_is_completed)) {
@@ -5609,9 +6127,163 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         }
     }
     if (advanced_primary_write) {
-        import_write->Accept();
+        import_write.Accept();
     }
     return {};
+}
+
+auto MasterService::PutEndMirrorRedis(const UUID& client_id,
+                                      const ObjectMeta& object_meta,
+                                      const TenantId& tenant_id,
+                                      ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    const auto& key = object_meta.key;
+    std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+    std::vector<ReplicaID> target_ids;
+    std::string payload;
+    size_t bucket = 0;
+    MirrorFingerprint committed_fp;
+    bool had_completed_replica = false;
+    bool advanced_primary_write = false;
+    bool completed_pending_replica = false;
+    std::optional<WeightStoreManager::ImportWriteGuard> import_write;
+
+    // Phase 1: commit memory first. Redis is allowed to lag behind a committed
+    // object; if it fails, Phase 3 rolls the target replicas back to PROCESSING.
+    {
+        MetadataAccessorRW accessor(this, object_id);
+        auto proceed =
+            PreparePutEndLocked(accessor, client_id, key, replica_type);
+        if (!proceed) return tl::make_unexpected(proceed.error());
+        if (!*proceed) return {};
+        auto& metadata = accessor.Get();
+
+        auto admission = weight_manager_.TrackImportWrite(
+            object_id.tenant_id, metadata.group_id);
+        if (!admission) {
+            return tl::make_unexpected(admission.error());
+        }
+        import_write.emplace(std::move(admission.value()));
+
+        had_completed_replica = metadata.HasReplica(&Replica::fn_is_completed);
+        advanced_primary_write = metadata.HasReplica(
+            [replica_type, this](const Replica& replica) {
+                return replica.is_processing() &&
+                       IsPutEndTargetReplica(replica, replica_type);
+            });
+        metadata.VisitReplicas(
+            [replica_type, this](const Replica& replica) {
+                return replica.is_processing() &&
+                       IsPutEndTargetReplica(replica, replica_type);
+            },
+            [this, &metadata, &target_ids,
+             &completed_pending_replica](Replica& replica) {
+                target_ids.push_back(replica.id());
+                if (metadata.PendingSoftPinOwnsReplica(replica.id())) {
+                    completed_pending_replica = true;
+                }
+                metadata.CommitSessionTag(replica.id());
+                replica.mark_complete();
+            });
+        if (target_ids.empty()) return {};
+        // Memory already holds COMPLETE replicas; the mirror writes that state.
+        payload = SerializeMetadataForOpLog(metadata);
+        bucket = MetaRedisBucket(object_id.tenant_id, key);
+        committed_fp = FingerprintMetadata(metadata);
+    }  // key lock released before Redis I/O
+
+    // Release the master-state lock too: the mirror write must not block
+    // mount/unmount/promotion. Phase 3 reacquires it and revalidates.
+    shared_lock.unlock();
+
+    // Phase 2: mirror the committed state without the key lock.
+    bool redis_ok = true;
+    MasterMetricManager::instance().inc_meta_redis_mirror();
+    redis_ok = meta_redis_->PutObject(bucket, object_id.tenant_id.value(), key,
+                                      payload);
+    if (!redis_ok) {
+        MasterMetricManager::instance().inc_meta_redis_mirror_fail();
+    }
+
+    // Phase 3: reacquire the key lock and decide whether the memory commit can
+    // stand. A committed object whose mirror failed is rolled back to
+    // PROCESSING; a committed object whose mirror succeeded stays committed.
+    shared_lock.lock();
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        if (redis_ok) RemoveObjectFromRedis(object_id.tenant_id, key);
+        LOG(WARNING) << "PutEnd: object vanished during Redis write, key="
+                     << key;
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    const std::unordered_set<ReplicaID> target_set(target_ids.begin(),
+                                                   target_ids.end());
+    bool targets_intact = (client_id == metadata.client_id);
+    if (targets_intact) {
+        size_t completed_targets = 0;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (target_set.contains(replica.id()) &&
+                replica.is_completed()) {
+                ++completed_targets;
+            }
+        }
+        targets_intact = completed_targets == target_ids.size();
+    }
+    const bool fp_intact =
+        targets_intact && FingerprintMetadata(metadata) == committed_fp;
+    auto rollback_targets = [&] {
+        metadata.VisitReplicas(
+            [&target_set](const Replica& replica) {
+                return replica.is_completed() &&
+                       target_set.contains(replica.id());
+            },
+            [](Replica& replica) { replica.mark_processing(); });
+    };
+
+    if (!redis_ok) {
+        if (targets_intact) {
+            rollback_targets();
+            // The pipeline may have written the object before failing; converge
+            // on absent so the failed put leaves no committed mirror either.
+            RemoveObjectFromRedis(object_id.tenant_id, key);
+            MasterMetricManager::instance()
+                .inc_meta_redis_write_ahead_rollback();
+            LOG(ERROR) << "PutEnd: Redis write failed for key=" << key
+                       << ", rolled back memory commit";
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        ResyncObjectToRedis(object_id.tenant_id, key, metadata);
+        MasterMetricManager::instance().inc_put_end_object_taken_over();
+        LOG(WARNING) << "PutEnd: object taken over during Redis write, key="
+                     << key;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+    if (!targets_intact) {
+        ResyncObjectToRedis(object_id.tenant_id, key, metadata);
+        MasterMetricManager::instance().inc_put_end_object_taken_over();
+        LOG(WARNING) << "PutEnd: object taken over during Redis write, key="
+                     << key;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+    if (!fp_intact) {
+        // The target replicas are still ours, but the mirror may describe an
+        // older state (for example a refcnt change from a read). Keep the
+        // memory commit and converge Redis on the current state.
+        ResyncObjectToRedis(object_id.tenant_id, key, metadata);
+        MasterMetricManager::instance().inc_put_end_metadata_changed();
+        LOG(WARNING) << "PutEnd: metadata changed during Redis write, key="
+                     << key;
+    }
+
+    if (!import_write) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return FinishPutEndLocked(accessor, object_meta, tenant_id, replica_type,
+                              *import_write, had_completed_replica,
+                              advanced_primary_write,
+                              completed_pending_replica);
 }
 
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
@@ -5660,7 +6332,8 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
     const ObjectIdentity object_id{normalized_tenant, key};
     MetadataAccessorRW accessor(this, object_id,
                                 MetadataAccessorRW::CreateKey{});
-    if (!accessor.IsPublished()) {
+    const bool created_object = !accessor.IsPublished();
+    if (created_object) {
         accessor.Publish(
             client_id, std::chrono::system_clock::now(),
             replica.get_descriptor().get_local_disk_descriptor().object_size,
@@ -5676,36 +6349,48 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
 
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    const Replica::Descriptor new_descriptor = replica.get_descriptor();
+
+    // Build the post-registration committed set without mutating memory. Both
+    // the Redis write-ahead below and the OpLog entry use exactly this state,
+    // so a registration is persisted before it becomes visible in memory.
+    std::vector<Replica::Descriptor> post;
+    post.reserve(metadata.GetAllReplicas().size() + 1);
+    for (const auto& existing : metadata.GetAllReplicas()) {
+        if (existing.status() != ReplicaStatus::COMPLETE) continue;
+        if (replacing_existing &&
+            existing.type() == ReplicaType::LOCAL_DISK &&
+            existing.get_descriptor().get_local_disk_descriptor().client_id ==
+                client_id) {
+            // Substitute with the updated descriptor.
+            Replica::Descriptor updated = existing.get_descriptor();
+            updated.get_local_disk_descriptor().transport_endpoint =
+                new_descriptor.get_local_disk_descriptor().transport_endpoint;
+            updated.get_local_disk_descriptor().object_size =
+                new_descriptor.get_local_disk_descriptor().object_size;
+            post.push_back(std::move(updated));
+        } else {
+            post.push_back(existing.get_descriptor());
+        }
+    }
+    if (!replacing_existing) {
+        // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
+        post.push_back(new_descriptor);
+    }
+
+    // Write-ahead the registration before it becomes visible in memory. The
+    // replica data already exists on the client's local disk, so the
+    // post-state is valid and a recovery may safely observe it.
+    if (!MirrorObjectStateToRedis(object_id.tenant_id, key, metadata, post)) {
+        if (created_object) {
+            accessor.Erase();
+        }
+        LOG(ERROR) << "AddReplica: Redis mirror failed for key=" << key
+                   << ", rejecting registration";
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
-        std::vector<Replica::Descriptor> post;
-        for (const auto& existing : metadata.GetAllReplicas()) {
-            if (existing.status() != ReplicaStatus::COMPLETE) continue;
-            if (replacing_existing &&
-                existing.type() == ReplicaType::LOCAL_DISK &&
-                existing.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .client_id == client_id) {
-                // Substitute with the updated descriptor.
-                Replica::Descriptor updated = existing.get_descriptor();
-                updated.get_local_disk_descriptor().transport_endpoint =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .transport_endpoint;
-                updated.get_local_disk_descriptor().object_size =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .object_size;
-                post.push_back(std::move(updated));
-            } else {
-                post.push_back(existing.get_descriptor());
-            }
-        }
-        if (!replacing_existing) {
-            // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
-            post.push_back(replica.get_descriptor());
-        }
-
         auto persist_result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key,
             SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post));
@@ -6496,6 +7181,21 @@ auto MasterService::EvictDiskReplicaImpl(const UUID& client_id,
         return true;
     }
 
+    // Redis and OpLog are mutually exclusive at startup, so a Redis-enabled
+    // master always reaches this direct path. A failed mirror keeps the
+    // in-memory replica, so recovery can never resurrect a replica whose
+    // backing file was already removed.
+    if (meta_redis_ && meta_redis_->Enabled()) {
+        auto remaining =
+            BuildRemainingReplicaDescriptors(metadata, target_pred);
+        if (!MirrorObjectStateToRedis(metadata.tenant_id, key, metadata,
+                                      remaining)) {
+            LOG(ERROR) << "EvictDiskReplica: Redis mirror failed for key="
+                       << key << ", replica_type=" << replica_type;
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+    }
+
     if (replica_type == ReplicaType::DISK || replica_type == ReplicaType::DFS) {
         EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
     } else if (replica_type == ReplicaType::LOCAL_DISK) {
@@ -6788,6 +7488,22 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", copy source becomes invalid during data transfer";
+        // Redis and OpLog are mutually exclusive at startup, so a Redis-enabled
+        // master always takes this direct cleanup path.
+        if (meta_redis_ && meta_redis_->Enabled()) {
+            auto remaining = BuildRemainingReplicaDescriptors(
+                metadata, [&task](const Replica& replica) {
+                    return std::find(task.replica_ids.begin(),
+                                     task.replica_ids.end(),
+                                     replica.id()) != task.replica_ids.end();
+                });
+            if (!MirrorObjectStateToRedis(metadata.tenant_id, key, metadata,
+                                          remaining)) {
+                LOG(ERROR) << "CopyEnd: Redis mirror failed for key=" << key
+                           << ", source invalid";
+                return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+            }
+        }
         // Release the refcnt taken in CopyStart. The success path below does
         // this once the copy completes; this error path must do it too, or the
         // source replica stays pinned and can never be evicted.
@@ -6838,6 +7554,30 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
             return tl::make_unexpected(reservation.error());
         }
         batch_reservation = std::move(reservation.value());
+    }
+
+    // Write-ahead the post-commit state: successful targets become COMPLETE,
+    // failed targets stay PROCESSING and are not mirrored. Redis and OpLog are
+    // mutually exclusive, so this gate only runs on the direct path.
+    if (meta_redis_ && meta_redis_->Enabled()) {
+        std::unordered_set<ReplicaID> commit_ids(commit_target_ids.begin(),
+                                                 commit_target_ids.end());
+        std::vector<Replica::Descriptor> post;
+        post.reserve(metadata.GetAllReplicas().size());
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (commit_ids.contains(replica.id())) {
+                auto desc = replica.get_descriptor();
+                desc.status = ReplicaStatus::COMPLETE;
+                post.push_back(std::move(desc));
+            } else if (replica.status() == ReplicaStatus::COMPLETE) {
+                post.push_back(replica.get_descriptor());
+            }
+        }
+        if (!MirrorObjectStateToRedis(metadata.tenant_id, key, metadata,
+                                      post)) {
+            LOG(ERROR) << "CopyEnd: Redis mirror failed for key=" << key;
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
     }
 
     source->dec_refcnt();
@@ -7147,6 +7887,22 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
                    << ", move source becomes invalid during data transfer";
+        // Redis and OpLog are mutually exclusive at startup, so a Redis-enabled
+        // master always takes this direct cleanup path.
+        if (meta_redis_ && meta_redis_->Enabled()) {
+            auto remaining = BuildRemainingReplicaDescriptors(
+                metadata, [&task](const Replica& replica) {
+                    return std::find(task.replica_ids.begin(),
+                                     task.replica_ids.end(),
+                                     replica.id()) != task.replica_ids.end();
+                });
+            if (!MirrorObjectStateToRedis(metadata.tenant_id, key, metadata,
+                                          remaining)) {
+                LOG(ERROR) << "MoveEnd: Redis mirror failed for key=" << key
+                           << ", source invalid";
+                return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+            }
+        }
         // Release the refcnt taken in MoveStart. The success path below does
         // this once the move completes; this error path must do it too, or the
         // source replica stays pinned and can never be evicted.
@@ -7217,12 +7973,14 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         }
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
+    const bool mirror_enabled = meta_redis_ && meta_redis_->Enabled();
+    std::vector<Replica::Descriptor> post;
+    if (mirror_enabled || (enable_oplog_ && ordered_oplog_writer_)) {
         // Build post-mutation descriptors:
         //   - existing COMPLETE replicas, except the source (about to be
         //   popped)
         //   - target (if any) flipped to COMPLETE
-        std::vector<Replica::Descriptor> post;
+        post.reserve(metadata.GetAllReplicas().size());
         for (const auto& rep : metadata.GetAllReplicas()) {
             if (rep.id() == source_id) continue;
             if (rep.status() == ReplicaStatus::COMPLETE) {
@@ -7235,7 +7993,19 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                 post.push_back(std::move(desc));
             }
         }
+    }
 
+    // Write-ahead the post-move state before releasing the source. Redis and
+    // OpLog are mutually exclusive, so this gate only runs on the direct path.
+    if (mirror_enabled) {
+        if (!MirrorObjectStateToRedis(metadata.tenant_id, key, metadata,
+                                      post)) {
+            LOG(ERROR) << "MoveEnd: Redis mirror failed for key=" << key;
+            return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+    }
+
+    if (enable_oplog_ && ordered_oplog_writer_) {
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         auto reservation = ReserveBatchOpLogSlot();
         if (!reservation) {
@@ -7391,7 +8161,9 @@ auto MasterService::RemoveObject(const std::string& key,
     if (enable_ha_ && enable_oplog_) {
         return MarkRemovedAndPersist(object_id.tenant_id, key, metadata);
     }
-    accessor.Erase();
+    if (!EraseObjectWithRedisGate(accessor, object_id.tenant_id, key)) {
+        return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
     return {};
 }
 
@@ -7502,7 +8274,10 @@ MasterService::RemoveResult MasterService::RemoveTenantObjects(
                 continue;
             }
         } else {
-            accessor.Erase();
+            if (!EraseObjectWithRedisGate(accessor, tenant_id, candidate.key)) {
+                result.skipped_object = true;
+                continue;
+            }
         }
         result.freed_bytes += freed;
         result.removed_count++;
@@ -7671,9 +8446,18 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                                             ? ErrorCode::OBJECT_NOT_FOUND
                                             : ErrorCode::OBJECT_ALREADY_EXISTS);
                 continue;
-            } else if (CleanupStaleHandles(key, normalized_tenant,
-                                           accessor.Get(),
-                                           accessor.GetState())) {
+            }
+
+            if (!PersistStaleHandleCleanupForRedis(
+                    "BatchRemove(stale cleanup)", normalized_tenant, key,
+                    accessor.Get(), cleanup_plan)) {
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+                continue;
+            }
+
+            if (CleanupStaleHandles(key, normalized_tenant, accessor.Get(),
+                                   accessor.GetState())) {
                 accessor.Erase();
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -7700,7 +8484,11 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 MarkRemovedAndPersist(normalized_tenant, key, metadata);
             continue;
         }
-        accessor.Erase();
+        if (!EraseObjectWithRedisGate(accessor, normalized_tenant, key)) {
+            results[original_idx] =
+                tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+            continue;
+        }
         results[original_idx] = {};  // Success
     }
 
@@ -8104,6 +8892,24 @@ void MasterService::RunShardDfsEviction() {
                                allow_evict_soft_pinned_objects_);
                 if (!accepted[i]) continue;
 
+                // Remove the replica from the object mirror before releasing
+                // the extent. The shard allocator HDELs oth:* outside its
+                // shard locks (see ResolvePreparedEviction), so a crash in
+                // between leaves at most an orphan oth record, never an
+                // object that references a released extent.
+                if (meta_redis_ && meta_redis_->Enabled()) {
+                    auto remaining = BuildRemainingReplicaDescriptors(
+                        metadata, [&](const Replica& replica) {
+                            return matches_candidate(replica, candidate) &&
+                                   !replica.is_processing();
+                        });
+                    if (!MirrorObjectStateToRedis(tenant_id, candidate.key,
+                                                  metadata, remaining)) {
+                        accepted[i] = false;
+                        continue;
+                    }
+                }
+
                 // A missing descriptor was accepted above and is already
                 // evicted from the master's point of view. Otherwise remove
                 // the accepted descriptor before its allocator extent can be
@@ -8426,48 +9232,110 @@ auto MasterService::NotifyOffloadSuccess(
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
                 if (offloading_task) {
-                    auto source =
-                        obj_metadata.GetReplicaByID(offloading_task->source_id);
-                    if (source != nullptr) {
-                        source->dec_refcnt();
-                    }
-                    offloading_task.reset();
-
                     if (!segment_mounted) {
+                        auto source = obj_metadata.GetReplicaByID(
+                            offloading_task->source_id);
+                        if (source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        offloading_task.reset();
                         // The offload bookkeeping above still ran; only the
                         // registration is refused.
                         refused_unmounted = true;
-                    } else if (!obj_metadata.HasReplica(
-                                   &Replica::fn_is_local_disk_replica)) {
-                        std::vector<Replica> replicas;
-                        replicas.emplace_back(std::move(replica));
-                        obj_metadata.AddReplicas(std::move(replicas));
-                        SyncCacheTotalAccounting(obj_metadata);
-                        MasterMetricManager::instance().inc_offload_completed(
-                            UuidToString(client_id));
-                        added_new_local_disk_replica = true;
                     } else {
-                        obj_metadata.VisitReplicas(
-                            [client_id](const Replica& rep) {
-                                return rep.type() == ReplicaType::LOCAL_DISK &&
-                                       rep.get_descriptor()
-                                               .get_local_disk_descriptor()
-                                               .client_id == client_id;
-                            },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
+                        const bool add_new_local_disk = !obj_metadata.HasReplica(
+                            &Replica::fn_is_local_disk_replica);
+                        const Replica::Descriptor new_descriptor =
+                            replica.get_descriptor();
+
+                        // Build the post-registration committed set without
+                        // touching memory, and persist it before making the
+                        // replica visible. The offload data already exists on
+                        // the client's local disk, so the post-state is valid.
+                        std::vector<Replica::Descriptor> post;
+                        post.reserve(obj_metadata.GetAllReplicas().size() + 1);
+                        for (const auto& existing :
+                             obj_metadata.GetAllReplicas()) {
+                            if (existing.status() != ReplicaStatus::COMPLETE) {
+                                continue;
+                            }
+                            if (!add_new_local_disk &&
+                                existing.type() == ReplicaType::LOCAL_DISK &&
+                                existing.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .client_id == client_id) {
+                                Replica::Descriptor updated =
+                                    existing.get_descriptor();
+                                updated.get_local_disk_descriptor()
                                     .transport_endpoint =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
+                                    new_descriptor.get_local_disk_descriptor()
                                         .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
+                                updated.get_local_disk_descriptor()
                                     .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
+                                    new_descriptor.get_local_disk_descriptor()
                                         .object_size;
-                            });
+                                post.push_back(std::move(updated));
+                            } else {
+                                post.push_back(existing.get_descriptor());
+                            }
+                        }
+                        if (add_new_local_disk) {
+                            post.push_back(new_descriptor);
+                        }
+
+                        if (!MirrorObjectStateToRedis(
+                                obj_metadata.tenant_id,
+                                request_object_id.user_key, obj_metadata,
+                                post)) {
+                            LOG(ERROR) << "NotifyOffloadSuccess: Redis mirror "
+                                          "failed, key="
+                                       << request_object_id.user_key
+                                       << ", rejecting registration";
+                            return tl::make_unexpected(
+                                ErrorCode::PERSISTENT_FAIL);
+                        }
+
+                        // The registration is durable; release the offload
+                        // bookkeeping only after the mirror succeeded.
+                        auto source = obj_metadata.GetReplicaByID(
+                            offloading_task->source_id);
+                        if (source != nullptr) {
+                            source->dec_refcnt();
+                        }
+                        offloading_task.reset();
+
+                        if (add_new_local_disk) {
+                            std::vector<Replica> replicas;
+                            replicas.emplace_back(std::move(replica));
+                            obj_metadata.AddReplicas(std::move(replicas));
+                            SyncCacheTotalAccounting(obj_metadata);
+                            MasterMetricManager::instance().inc_offload_completed(
+                                UuidToString(client_id));
+                            added_new_local_disk_replica = true;
+                        } else {
+                            obj_metadata.VisitReplicas(
+                                [client_id](const Replica& rep) {
+                                    return rep.type() ==
+                                               ReplicaType::LOCAL_DISK &&
+                                           rep.get_descriptor()
+                                                   .get_local_disk_descriptor()
+                                                   .client_id == client_id;
+                                },
+                                [&new_descriptor](Replica& rep) {
+                                    rep.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .transport_endpoint =
+                                        new_descriptor
+                                            .get_local_disk_descriptor()
+                                            .transport_endpoint;
+                                    rep.get_descriptor()
+                                        .get_local_disk_descriptor()
+                                        .object_size =
+                                        new_descriptor
+                                            .get_local_disk_descriptor()
+                                            .object_size;
+                                });
+                        }
                     }
                     handled_existing_object = true;
                 }
@@ -9380,6 +10248,32 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
             }
             batch_reservation = std::move(reservation.value());
         }
+
+        // Write-ahead the committed replica set: staged becomes COMPLETE,
+        // existing COMPLETE replicas (including the LOCAL_DISK source) stay.
+        // Redis and OpLog are mutually exclusive, so this only runs on the
+        // direct path.
+        if (meta_redis_ && meta_redis_->Enabled()) {
+            std::vector<Replica::Descriptor> post;
+            post.reserve(metadata.GetAllReplicas().size());
+            for (const auto& replica : metadata.GetAllReplicas()) {
+                if (replica.id() == promotion_task->alloc_id) {
+                    auto desc = replica.get_descriptor();
+                    desc.status = ReplicaStatus::COMPLETE;
+                    post.push_back(std::move(desc));
+                } else if (replica.status() == ReplicaStatus::COMPLETE) {
+                    post.push_back(replica.get_descriptor());
+                }
+            }
+            if (!MirrorObjectStateToRedis(metadata.tenant_id, key, metadata,
+                                          post)) {
+                LOG(ERROR)
+                    << "NotifyPromotionSuccess: Redis mirror failed for key="
+                    << key;
+                return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
+            }
+        }
+
         staged->mark_complete();
         committed = true;
         if (enable_oplog_ && ordered_oplog_writer_) {
@@ -9679,7 +10573,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
             metadata.ClearPendingSoftPinIfNoViableReplica();
             metadata.ClearSessionTagIfNoViableReplica();
             if (!metadata.IsValid()) {
-                accessor.Erase();
+                // Completed replicas may still be mirrored from before their
+                // handles went invalid; converge the mirror before erasing.
+                if (RedisHDelGate(tenant_id, key)) {
+                    accessor.Erase();
+                }
             } else {
                 accessor.EraseFromProcessing();
             }
@@ -9732,7 +10630,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
-                accessor.Erase();
+                // The discarded replicas were PROCESSING, but the object may
+                // still hold completed replicas the mirror knows about.
+                if (RedisHDelGate(tenant_id, key)) {
+                    accessor.Erase();
+                }
             } else {
                 accessor.EraseFromProcessing();
             }
@@ -9824,10 +10726,15 @@ void MasterService::DiscardExpiredProcessingReplicas(
                                                     accessor.GetState());
         }
         if (!metadata.IsValid()) {
-            accessor.Erase();
-        } else {
-            task.reset();
+            // The replication targets are PROCESSING, but completed replicas
+            // left behind may still be mirrored; clear the mirror first and,
+            // if it fails, keep only the task drop so the next pass retries.
+            if (RedisHDelGate(tenant_id, key)) {
+                accessor.Erase();
+                continue;
+            }
         }
+        task.reset();
     }
 
     for (const auto& key : keys) {
@@ -10079,6 +10986,17 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             continue;
         }
 
+        if (meta_redis_ && meta_redis_->Enabled()) {
+            auto remaining = BuildRemainingReplicaDescriptors(
+                metadata, is_evictable_nof_replica);
+            if (!MirrorObjectStateToRedis(tenant_id, key, metadata,
+                                          remaining)) {
+                LOG(WARNING) << "NoFBatchEvict: Redis mirror failed for key="
+                             << key << ", skipping eviction";
+                continue;
+            }
+        }
+
         const size_t erased = metadata.EraseReplicas(is_evictable_nof_replica);
         if (erased == 0) {
             continue;
@@ -10087,6 +11005,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         total_freed_size += metadata.TotalLength() * erased;
         evicted_count++;
         if (!metadata.IsValid()) {
+            // remaining was empty, so the mirror was already removed above.
             accessor.Erase();
         }
     }
@@ -10164,7 +11083,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         }
     }
 
-    ClearInvalidHandlesLocked();
+    (void)ClearInvalidHandlesLocked();
 
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
