@@ -2820,4 +2820,65 @@ TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {
     EXPECT_TRUE((*backend)->Init().has_value());
 }
 
+// Opt-in smoke test for the per-shard Redis actors. Set
+// MOONCAKE_DFS_REDIS_TEST_CONNSTRING (e.g. 172.17.0.1:6380) to run.
+TEST(ShardAllocatorTest, RedisActorsHandleConcurrentCommitFree) {
+    const char* connstring = std::getenv("MOONCAKE_DFS_REDIS_TEST_CONNSTRING");
+    if (connstring == nullptr || *connstring == '\0') {
+        GTEST_SKIP() << "MOONCAKE_DFS_REDIS_TEST_CONNSTRING is not set";
+    }
+
+    TempDir tmp("dfs_redis_actor");
+    auto config = MakeAllocatorConfig(tmp.path(), 2, 16 * 1024 * 1024, 4096);
+    config.fs_adapter_type = "posix";
+    config.allocator_type = "shard";
+    config.eviction_enabled = false;
+    config.deferred_free_duration = std::chrono::seconds(0);
+    config.redis_connstring = connstring;
+    config.redis_namespace =
+        "dfs-actor-smoke-" +
+        std::to_string(std::chrono::system_clock::now()
+                           .time_since_epoch()
+                           .count());
+    config.redis_write_conns = 4;
+
+    ShardAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config).has_value());
+
+    constexpr int kThreads = 4;
+    constexpr int kPerThread = 100;
+    std::atomic<int> allocated{0};
+    std::atomic<int> committed{0};
+    std::atomic<int> failed{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&allocator, t, &allocated, &committed, &failed] {
+            for (int i = 0; i < kPerThread; ++i) {
+                const std::string key =
+                    "redis-actor-" + std::to_string(t) + "-" +
+                    std::to_string(i);
+                auto alloc = allocator.Allocate(key, 8192);
+                if (!alloc) {
+                    failed.fetch_add(1);
+                    continue;
+                }
+                allocated.fetch_add(1);
+                if (!allocator.CommitAllocation(alloc->shard_idx,
+                                                alloc->offset)) {
+                    failed.fetch_add(1);
+                    continue;
+                }
+                committed.fetch_add(1);
+                allocator.Free(key, *alloc);
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+
+    EXPECT_EQ(failed.load(), 0);
+    EXPECT_EQ(allocated.load(), kThreads * kPerThread);
+    EXPECT_EQ(committed.load(), kThreads * kPerThread);
+}
+
 }  // namespace mooncake::test

@@ -883,6 +883,15 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
     auto dfs_config = DistributedStorageConfig::FromEnvironment();
+    if (redis_recovery_enabled_) {
+        dfs_config.redis_connstring =
+            GetEnvString("MOONCAKE_META_REDIS_CONNSTRING");
+        dfs_config.redis_namespace = cluster_id_;
+        dfs_config.redis_write_conns =
+            GetEnvInt("MOONCAKE_META_REDIS_WRITE_CONNS", 0);
+    } else {
+        dfs_config.redis_connstring.clear();
+    }
     // KVCS is an object-storage backend and does not use the filesystem DFS
     // allocator, but it still enables the distributed-storage path.
     enable_dfs_ =
@@ -946,6 +955,15 @@ void MasterService::InitDfsAllocatorFromEnvironment(
                      "DFS extent allocator, config={"
                   << dfs_config.FormatStr() << "}";
         return;
+    }
+
+    // The Redis metadata mirror carries a per-extent ledger only for the shard
+    // allocator. Bucket mode has immutable whole-bucket files and no recovery
+    // source, so reject it before any shard file is created.
+    if (redis_recovery_enabled_ && dfs_config.allocator_type == "bucket") {
+        LOG(FATAL) << "MOONCAKE_ENABLE_REDIS_RECOVERY supports only the shard "
+                      "DFS allocator; set MOONCAKE_DFS_ALLOCATOR=shard instead "
+                      "of bucket";
     }
 
     if (recovery_enabled) {
@@ -6141,6 +6159,7 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
     std::shared_lock<std::shared_mutex> shared_lock(master_state_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     std::vector<ReplicaID> target_ids;
+    std::vector<std::pair<int, uint64_t>> dfs_allocs;
     std::string payload;
     size_t bucket = 0;
     MirrorFingerprint committed_fp;
@@ -6177,7 +6196,7 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
                 return replica.is_processing() &&
                        IsPutEndTargetReplica(replica, replica_type);
             },
-            [this, &metadata, &target_ids,
+            [this, &key, &metadata, &target_ids, &dfs_allocs,
              &completed_pending_replica](Replica& replica) {
                 target_ids.push_back(replica.id());
                 if (metadata.PendingSoftPinOwnsReplica(replica.id())) {
@@ -6185,6 +6204,11 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
                 }
                 metadata.CommitSessionTag(replica.id());
                 replica.mark_complete();
+                if (replica.is_dfs_replica() && dfs_allocator_) {
+                    const auto& desc = replica.get_dfs_descriptor();
+                    dfs_allocator_->UpdateAccess(key, desc);
+                    dfs_allocs.emplace_back(desc.shard_idx, desc.offset);
+                }
             });
         if (target_ids.empty()) return {};
         // Memory already holds COMPLETE replicas; the mirror writes that state.
@@ -6197,11 +6221,44 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
     // mount/unmount/promotion. Phase 3 reacquires it and revalidates.
     shared_lock.unlock();
 
-    // Phase 2: mirror the committed state without the key lock.
+    // Phase 2: mirror the committed state without the key lock. The object
+    // metadata and every DFS allocator ledger record are one Redis pipeline,
+    // so a key costs one network round trip.
     bool redis_ok = true;
-    MasterMetricManager::instance().inc_meta_redis_mirror();
-    redis_ok = meta_redis_->PutObject(bucket, object_id.tenant_id.value(), key,
-                                      payload);
+    std::vector<MasterMetaRedisStore::HSetCmd> extra;
+    std::vector<std::pair<int, uint64_t>> dfs_persisted;
+    if (shard_allocator_ != nullptr && !dfs_allocs.empty()) {
+        extra.reserve(dfs_allocs.size());
+        dfs_persisted.reserve(dfs_allocs.size());
+        for (const auto& [shard_idx, offset] : dfs_allocs) {
+            MasterMetaRedisStore::HSetCmd cmd;
+            if (shard_allocator_->PrepareCommitRecord(
+                    shard_idx, offset, cmd.hash_key, cmd.field, cmd.value)) {
+                extra.push_back(std::move(cmd));
+                dfs_persisted.emplace_back(shard_idx, offset);
+                continue;
+            }
+            // Record vanished under the shard lock; keep the old semantics
+            // (CommitAllocation is a no-op success when it is gone).
+            if (!shard_allocator_->CommitAllocation(shard_idx, offset)) {
+                redis_ok = false;
+                break;
+            }
+            dfs_persisted.emplace_back(shard_idx, offset);
+        }
+    }
+    if (redis_ok) {
+        if (extra.empty()) {
+            MasterMetricManager::instance().inc_meta_redis_mirror();
+            redis_ok = meta_redis_->PutObject(
+                bucket, object_id.tenant_id.value(), key, payload);
+        } else {
+            MasterMetricManager::instance().inc_meta_redis_mirror(
+                static_cast<int64_t>(extra.size() + 1));
+            redis_ok = meta_redis_->PutObjectAndHashes(
+                bucket, object_id.tenant_id.value(), key, payload, extra);
+        }
+    }
     if (!redis_ok) {
         MasterMetricManager::instance().inc_meta_redis_mirror_fail();
     }
@@ -6212,6 +6269,11 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
     shared_lock.lock();
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
+        for (const auto& [shard_idx, offset] : dfs_persisted) {
+            if (shard_allocator_ != nullptr) {
+                shard_allocator_->UncommitAllocation(shard_idx, offset);
+            }
+        }
         if (redis_ok) RemoveObjectFromRedis(object_id.tenant_id, key);
         LOG(WARNING) << "PutEnd: object vanished during Redis write, key="
                      << key;
@@ -6240,6 +6302,11 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
                        target_set.contains(replica.id());
             },
             [](Replica& replica) { replica.mark_processing(); });
+        for (const auto& [shard_idx, offset] : dfs_persisted) {
+            if (shard_allocator_ != nullptr) {
+                shard_allocator_->UncommitAllocation(shard_idx, offset);
+            }
+        }
     };
 
     if (!redis_ok) {
@@ -6254,6 +6321,11 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
                        << ", rolled back memory commit";
             return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
         }
+        for (const auto& [shard_idx, offset] : dfs_persisted) {
+            if (shard_allocator_ != nullptr) {
+                shard_allocator_->UncommitAllocation(shard_idx, offset);
+            }
+        }
         ResyncObjectToRedis(object_id.tenant_id, key, metadata);
         MasterMetricManager::instance().inc_put_end_object_taken_over();
         LOG(WARNING) << "PutEnd: object taken over during Redis write, key="
@@ -6261,6 +6333,11 @@ auto MasterService::PutEndMirrorRedis(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
     if (!targets_intact) {
+        for (const auto& [shard_idx, offset] : dfs_persisted) {
+            if (shard_allocator_ != nullptr) {
+                shard_allocator_->UncommitAllocation(shard_idx, offset);
+            }
+        }
         ResyncObjectToRedis(object_id.tenant_id, key, metadata);
         MasterMetricManager::instance().inc_put_end_object_taken_over();
         LOG(WARNING) << "PutEnd: object taken over during Redis write, key="

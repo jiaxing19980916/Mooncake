@@ -3,13 +3,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <functional>
+#include <future>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -17,6 +21,7 @@
 
 #include "offset_allocator/offset_allocator.h"
 #include "replica.h"
+#include "ha/common/redis/redis_connection.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/dfs_allocator_interface.h"
 #include "types.h"
@@ -112,6 +117,18 @@ class ShardAllocator final : public DfsAllocatorInterface {
     uint64_t GetTotalCapacity() const override;
     uint64_t GetFileCount() const override;
 
+    // ===== Redis persistence of offset_to_handle (single writer: master) =====
+    // Builds one oth:<shard> record without Redis so PutEnd can pipeline it
+    // with the object metadata in one round trip. Returns false when the
+    // allocation is no longer present under the shard lock.
+    bool PrepareCommitRecord(int shard_idx, uint64_t alloc_offset,
+                             std::string& hash_key, std::string& field,
+                             std::string& value) const;
+    // HSET one allocation record. True on success/no-op, false only on error.
+    bool CommitAllocation(int shard_idx, uint64_t alloc_offset);
+    // HDEL one allocation record, used by PutEnd rollback.
+    void UncommitAllocation(int shard_idx, uint64_t alloc_offset);
+
     static std::string FormatShardIdx(int idx, int shard_count);
 
    private:
@@ -127,7 +144,12 @@ class ShardAllocator final : public DfsAllocatorInterface {
             std::string key;
             std::shared_ptr<OffsetAllocationHandle> handle;
             uint64_t bytes = 0;
+            uint64_t object_size = 0;  // original value length for Redis
             bool eviction_prepared = false;
+            // Set while Free() HDELs the ledger outside the shard locks. The
+            // extent stays allocated (so the offset cannot be reused) and is
+            // skipped by UpdateAccess / eviction / a second Free.
+            bool free_prepared = false;
         };
 
         std::shared_mutex handle_mutex;
@@ -180,6 +202,15 @@ class ShardAllocator final : public DfsAllocatorInterface {
                                   PendingEviction& pending);
     uint64_t AlignSize(uint64_t size) const;
 
+    // ===== Redis ledger helpers =====
+    std::string ShardHashPrefix() const;
+    std::string ShardHashKey(int shard_idx) const;
+    int ParseShardIdxFromHashKey(const std::string& hash_key) const;
+    bool RedisPersistRecord(int shard_idx, const std::string& hash_key,
+                            const std::string& field,
+                            const std::string& value);
+    bool RedisRemoveAlloc(int shard_idx, uint64_t alloc_offset);
+
     std::string mount_path_;
     uint64_t shard_capacity_ = 0;
     uint64_t alignment_ = 4096;
@@ -200,6 +231,47 @@ class ShardAllocator final : public DfsAllocatorInterface {
     std::chrono::seconds eviction_check_interval_{5};
     std::atomic<bool> initialized_{false};
     std::array<std::mutex, kNumKeyStripes> key_stripes_;
+
+    // Per-shard Redis actors, striped by shard index. Each connection is owned
+    // by one I/O thread; callers enqueue and wait on a promise, so the queue
+    // mutex never covers a network RTT.
+    bool redis_enabled_ = false;
+    std::string redis_connstring_;
+    std::string redis_namespace_;
+    int redis_pscan_shards_ = 0;
+    int redis_write_conns_ = 0;
+    struct RedisConn;
+    struct RedisJob {
+        std::function<bool(RedisConn&)> run;
+        std::promise<bool> done;
+    };
+    struct RedisConn {
+        static constexpr size_t kQueueLimit = 1024;
+
+        std::mutex mutex;
+        std::condition_variable work_cv;
+        std::condition_variable space_cv;
+        std::deque<RedisJob> queue;
+        std::thread worker;
+        bool stopping = false;
+        // Actor-only after Init; no other thread touches ctx.
+        ha::common::redis::RedisContextPtr ctx;
+    };
+    std::vector<std::unique_ptr<RedisConn>> redis_conns_;
+#ifdef STORE_USE_REDIS
+    RedisConn& RedisConnForShard(int shard_idx) {
+        return *redis_conns_[static_cast<size_t>(shard_idx) %
+                             redis_conns_.size()];
+    }
+    bool Submit(RedisConn& conn, std::function<bool(RedisConn&)> job);
+    void ActorLoop(RedisConn& conn);
+    bool EnsureRedisConnected(RedisConn& conn);
+    bool DoRedisPersistRecord(RedisConn& conn, const std::string& hash_key,
+                              const std::string& field,
+                              const std::string& value);
+    bool DoRedisRemoveAlloc(RedisConn& conn, const std::string& hash_key,
+                            const std::string& field);
+#endif
 };
 
 }  // namespace mooncake

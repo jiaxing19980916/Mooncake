@@ -67,6 +67,15 @@ class MasterMetaRedisStore {
         size_t bucket,
         const std::vector<std::pair<std::string, std::string_view>>&
             field_values);
+    // Object mirror and extra hash writes e.g. oth in one pipelined HSET batch one round trip.
+    struct HSetCmd {
+        std::string hash_key;
+        std::string field;
+        std::string value;
+    };
+    bool PutObjectAndHashes(size_t bucket, std::string_view tenant_id,
+                            std::string_view key, std::string_view payload,
+                            const std::vector<HSetCmd>& extra);
     // Returns true on success (or when disabled -> no-op), false on HSET
     // failure, so the caller can gate mount success on the segment being
     // mirrored (symmetric to PutObject's write-ahead gate).
@@ -129,6 +138,10 @@ class MasterMetaRedisStore {
     bool DoPutObjects(
         ConnSlot& slot, size_t bucket,
         const std::vector<std::pair<std::string, std::string>>& field_values);
+    bool DoPutObjectAndHashes(ConnSlot& slot, size_t bucket,
+                              std::string_view tenant_id, std::string_view key,
+                              std::string_view payload,
+                              const std::vector<HSetCmd>& extra);
 #endif
 
     Config config_;

@@ -14,11 +14,25 @@
 #include "config/distributed_storage_config.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#ifdef STORE_USE_REDIS
+#include <hiredis/hiredis.h>
+#include <ylt/struct_pack.hpp>
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
 
 namespace mooncake {
+
+namespace {
+// Persisted per-allocation ledger record: field=alloc_offset, value=this.
+struct DfsAllocRecord {
+    uint64_t raw_offset = 0;
+    uint64_t object_size = 0;
+    std::string key;
+    YLT_REFL(DfsAllocRecord, raw_offset, object_size, key);
+};
+}  // namespace
 
 ShardAllocator::PendingEviction::~PendingEviction() {
     if (owner_ != nullptr) {
@@ -33,6 +47,19 @@ ShardAllocator::PendingEviction::PendingEviction(
       prepared_(std::move(other.prepared_)) {}
 
 ShardAllocator::~ShardAllocator() {
+#ifdef STORE_USE_REDIS
+    for (auto& conn : redis_conns_) {
+        {
+            std::lock_guard<std::mutex> lock(conn->mutex);
+            conn->stopping = true;
+        }
+        conn->work_cv.notify_all();
+        conn->space_cv.notify_all();
+    }
+    for (auto& conn : redis_conns_) {
+        if (conn->worker.joinable()) conn->worker.join();
+    }
+#endif
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
@@ -56,6 +83,29 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
     eviction_low_watermark_ = config.eviction_low_watermark;
     deferred_free_duration_ = config.deferred_free_duration;
     eviction_check_interval_ = config.eviction_check_interval;
+
+    redis_connstring_ = config.redis_connstring;
+    redis_namespace_ =
+        ha::common::redis::SanitizeHashTagComponent(config.redis_namespace);
+    redis_enabled_ = !redis_connstring_.empty();
+    redis_pscan_shards_ = config.redis_pscan_shards;
+    redis_write_conns_ = config.redis_write_conns;
+    const size_t redis_conn_count =
+        redis_write_conns_ > 0 ? static_cast<size_t>(redis_write_conns_) : 1;
+    redis_conns_.clear();
+    redis_conns_.reserve(redis_conn_count);
+    for (size_t i = 0; i < redis_conn_count; ++i) {
+        redis_conns_.push_back(std::make_unique<RedisConn>());
+    }
+#ifdef STORE_USE_REDIS
+    if (redis_enabled_) {
+        for (auto& conn : redis_conns_) {
+            conn->worker = std::thread([this, conn = conn.get()] {
+                ActorLoop(*conn);
+            });
+        }
+    }
+#endif
 
     std::error_code ec;
     std::filesystem::create_directories(mount_path_, ec);
@@ -151,6 +201,7 @@ tl::expected<void, ErrorCode> ShardAllocator::Init(
         LOG(ERROR) << "Failed to initialize DFS shards: " << error.what();
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
+
     initialized_.store(true, std::memory_order_release);
     return {};
 }
@@ -297,7 +348,7 @@ tl::expected<DistributedFSDescriptor, ErrorCode> ShardAllocator::Allocate(
         auto alloc_handle =
             std::make_shared<OffsetAllocationHandle>(std::move(*handle));
         shard.offset_to_handle[alloc_offset] = {key, std::move(alloc_handle),
-                                                reserved_bytes};
+                                                reserved_bytes, size};
         return DistributedFSDescriptor{shard.path, alloc_offset, size,
                                        aligned_size,
                                        static_cast<int>(shard_idx)};
@@ -385,8 +436,62 @@ void ShardAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
     if (shard_idx < 0 || shard_idx >= static_cast<int>(shards->size())) return;
 
     auto& shard = *(*shards)[shard_idx];
+    if (!redis_enabled_) {
+        std::lock_guard lru_lock(shard.lru_mutex);
+        std::lock_guard handle_lock(shard.handle_mutex);
+        auto it = shard.offset_to_handle.find(offset);
+        if (it == shard.offset_to_handle.end()) return;
+        if (it->second.key != key) return;
+        if (it->second.eviction_prepared || it->second.free_prepared) return;
+        auto lru_it = shard.lru_index.find(key);
+        if (lru_it != shard.lru_index.end() &&
+            lru_it->second->second == offset) {
+            const auto list_it = lru_it->second;
+            shard.lru_index.erase(lru_it);
+            shard.lru_list.erase(list_it);
+        }
+        QueuePendingFree(
+            shard, it->second.handle, it->second.bytes,
+            std::chrono::steady_clock::now() + deferred_free_duration_);
+        shard.offset_to_handle.erase(it);
+        return;
+    }
+
+    std::shared_ptr<OffsetAllocationHandle> expected_handle;
+    {
+        std::lock_guard lru_lock(shard.lru_mutex);
+        std::lock_guard handle_lock(shard.handle_mutex);
+        auto it = shard.offset_to_handle.find(offset);
+        if (it == shard.offset_to_handle.end()) return;
+        if (it->second.key != key) return;
+        // A prepared eviction owns this extent until Resolve/Commit settles
+        // it; a concurrent Free is already past the Redis step.
+        if (it->second.eviction_prepared || it->second.free_prepared) return;
+        // Keep the handle allocated while the lock is released, so the offset
+        // cannot be reused before the ledger HDEL settles.
+        it->second.free_prepared = true;
+        expected_handle = it->second.handle;
+    }
+
+    // Redis first, outside the shard locks: a failed HDEL keeps the
+    // allocation (and its LRU entry) so a restart cannot resurrect an extent
+    // still marked live in memory.
+    const bool hdel_ok = RedisRemoveAlloc(shard_idx, offset);
+
     std::lock_guard lru_lock(shard.lru_mutex);
     std::lock_guard handle_lock(shard.handle_mutex);
+    auto it = shard.offset_to_handle.find(offset);
+    if (it == shard.offset_to_handle.end() || it->second.key != key ||
+        it->second.handle != expected_handle || !it->second.free_prepared) {
+        // Another path retired it while the locks were released.
+        return;
+    }
+    if (!hdel_ok) {
+        it->second.free_prepared = false;
+        LOG(ERROR) << "DFS Free: Redis HDEL failed, keeping allocation, shard="
+                   << shard_idx << ", offset=" << offset;
+        return;
+    }
 
     auto lru_it = shard.lru_index.find(key);
     if (lru_it != shard.lru_index.end() && lru_it->second->second == offset) {
@@ -394,11 +499,6 @@ void ShardAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
         shard.lru_index.erase(lru_it);
         shard.lru_list.erase(list_it);
     }
-
-    auto it = shard.offset_to_handle.find(offset);
-    if (it == shard.offset_to_handle.end()) return;
-    if (it->second.key != key) return;
-
     QueuePendingFree(
         shard, it->second.handle, it->second.bytes,
         std::chrono::steady_clock::now() + deferred_free_duration_);
@@ -418,7 +518,8 @@ void ShardAllocator::UpdateAccess(const std::string& key, int shard_idx,
         auto handle_it = shard.offset_to_handle.find(offset);
         if (handle_it == shard.offset_to_handle.end() ||
             handle_it->second.key != key ||
-            handle_it->second.eviction_prepared) {
+            handle_it->second.eviction_prepared ||
+            handle_it->second.free_prepared) {
             return;
         }
     }
@@ -458,12 +559,29 @@ void ShardAllocator::CommitPreparedEviction(PendingEviction&& pending) {
         std::chrono::steady_clock::now() + deferred_free_duration_;
     for (const auto& prepared : pending.prepared_) {
         auto& shard = *(*shards)[prepared.candidate.shard_idx];
+        std::lock_guard lru_lock(shard.lru_mutex);
         std::lock_guard handle_lock(shard.handle_mutex);
         auto it = shard.offset_to_handle.find(prepared.candidate.offset);
         if (it == shard.offset_to_handle.end() ||
             it->second.key != prepared.candidate.key ||
             it->second.handle != prepared.handle) {
             // A concurrent metadata removal may already have called Free().
+            continue;
+        }
+        if (redis_enabled_ &&
+            !RedisRemoveAlloc(prepared.candidate.shard_idx,
+                              prepared.candidate.offset)) {
+            LOG(ERROR) << "DFS eviction: Redis HDEL failed, keeping extent, "
+                       << "shard=" << prepared.candidate.shard_idx
+                       << ", offset=" << prepared.candidate.offset;
+            it->second.eviction_prepared = false;
+            if (shard.lru_index.find(prepared.candidate.key) ==
+                shard.lru_index.end()) {
+                shard.lru_list.push_back(
+                    {prepared.candidate.key, prepared.candidate.offset});
+                shard.lru_index.emplace(shard.lru_list.back().first,
+                                        std::prev(shard.lru_list.end()));
+            }
             continue;
         }
 
@@ -524,6 +642,41 @@ void ShardAllocator::ResolvePreparedEviction(
         return;
     }
 
+    // HDEL the allocator ledger outside the shard locks. The prepared extent
+    // keeps its handle allocated and Free() refuses to retire a prepared
+    // extent, so the offset cannot be reused between validation and HDEL.
+    std::vector<bool> hdel_ok(pending.prepared_.size(), !redis_enabled_);
+    if (redis_enabled_) {
+        std::vector<size_t> hdel_indexes;
+        hdel_indexes.reserve(pending.prepared_.size());
+        for (size_t i = 0; i < pending.prepared_.size(); ++i) {
+            if (!accepted[i]) continue;
+            const auto& prepared = pending.prepared_[i];
+            auto& shard = *(*shards)[prepared.candidate.shard_idx];
+            std::lock_guard lru_lock(shard.lru_mutex);
+            std::lock_guard handle_lock(shard.handle_mutex);
+            auto handle_it =
+                shard.offset_to_handle.find(prepared.candidate.offset);
+            if (handle_it == shard.offset_to_handle.end() ||
+                handle_it->second.key != prepared.candidate.key ||
+                handle_it->second.handle != prepared.handle) {
+                continue;
+            }
+            hdel_indexes.push_back(i);
+        }
+        for (const size_t i : hdel_indexes) {
+            const auto& prepared = pending.prepared_[i];
+            if (!RedisRemoveAlloc(prepared.candidate.shard_idx,
+                                  prepared.candidate.offset)) {
+                LOG(ERROR) << "DFS eviction: Redis HDEL failed, keeping extent, "
+                           << "shard=" << prepared.candidate.shard_idx
+                           << ", offset=" << prepared.candidate.offset;
+                continue;
+            }
+            hdel_ok[i] = true;
+        }
+    }
+
     const auto free_at =
         std::chrono::steady_clock::now() + deferred_free_duration_;
     for (size_t i = 0; i < pending.prepared_.size(); ++i) {
@@ -531,12 +684,24 @@ void ShardAllocator::ResolvePreparedEviction(
 
         const auto& prepared = pending.prepared_[i];
         auto& shard = *(*shards)[prepared.candidate.shard_idx];
+        std::lock_guard lru_lock(shard.lru_mutex);
         std::lock_guard handle_lock(shard.handle_mutex);
         auto handle_it = shard.offset_to_handle.find(prepared.candidate.offset);
         if (handle_it == shard.offset_to_handle.end() ||
             handle_it->second.key != prepared.candidate.key ||
             handle_it->second.handle != prepared.handle) {
             // Free() or a replacement already retired this allocation.
+            continue;
+        }
+        if (redis_enabled_ && !hdel_ok[i]) {
+            handle_it->second.eviction_prepared = false;
+            if (shard.lru_index.find(prepared.candidate.key) ==
+                shard.lru_index.end()) {
+                shard.lru_list.push_back(
+                    {prepared.candidate.key, prepared.candidate.offset});
+                shard.lru_index.emplace(shard.lru_list.back().first,
+                                        std::prev(shard.lru_list.end()));
+            }
             continue;
         }
 
@@ -658,8 +823,18 @@ void ShardAllocator::PrepareEvictionFromShard(ShardState& shard, int shard_idx,
 
         auto handle_it = shard.offset_to_handle.find(evict_offset);
         if (handle_it == shard.offset_to_handle.end() ||
-            handle_it->second.key != evict_key ||
-            handle_it->second.eviction_prepared) {
+            handle_it->second.key != evict_key) {
+            shard.lru_index.erase(evict_key);
+            shard.lru_list.erase(lru_it);
+            continue;
+        }
+        if (handle_it->second.free_prepared) {
+            // An in-flight Free() owns this extent. Stop this round rather
+            // than dropping its LRU node: a failed HDEL keeps the allocation
+            // and must keep its eviction entry too.
+            break;
+        }
+        if (handle_it->second.eviction_prepared) {
             shard.lru_index.erase(evict_key);
             shard.lru_list.erase(lru_it);
             continue;
@@ -687,6 +862,224 @@ void ShardAllocator::PrepareEvictionFromShard(ShardState& shard, int shard_idx,
         if (projected_usage < eviction_low_watermark_) break;
     }
 }
+
+std::string ShardAllocator::ShardHashPrefix() const {
+    const std::string prefix =
+        redis_namespace_.empty() ? std::string() : redis_namespace_ + ":";
+    return prefix + "oth:";
+}
+
+std::string ShardAllocator::ShardHashKey(int shard_idx) const {
+    return ShardHashPrefix() + FormatShardIdx(shard_idx, GetShardCount());
+}
+
+int ShardAllocator::ParseShardIdxFromHashKey(
+    const std::string& hash_key) const {
+    const std::string prefix = ShardHashPrefix();
+    if (hash_key.size() <= prefix.size()) return -1;
+    if (hash_key.compare(0, prefix.size(), prefix) != 0) return -1;
+    const std::string suffix = hash_key.substr(prefix.size());
+    if (suffix.empty() ||
+        suffix.find_first_not_of("0123456789") != std::string::npos) {
+        return -1;
+    }
+    int idx = -1;
+    try {
+        idx = std::stoi(suffix);
+    } catch (const std::exception&) {
+        return -1;
+    }
+    if (idx < 0 || idx >= GetShardCount()) return -1;
+    return idx;
+}
+
+bool ShardAllocator::PrepareCommitRecord(int shard_idx, uint64_t alloc_offset,
+                                         std::string& hash_key,
+                                         std::string& field,
+                                         std::string& value) const {
+    if (!redis_enabled_) return false;
+    if (!initialized_.load(std::memory_order_acquire)) return false;
+    const auto* shards = shards_.load(std::memory_order_acquire);
+    if (!shards || shard_idx < 0 ||
+        shard_idx >= static_cast<int>(shards->size())) {
+        return false;
+    }
+    auto& shard = *(*shards)[shard_idx];
+    uint64_t raw_offset = 0;
+    uint64_t object_size = 0;
+    std::string key;
+    {
+        std::shared_lock lock(shard.handle_mutex);
+        auto it = shard.offset_to_handle.find(alloc_offset);
+        if (it == shard.offset_to_handle.end() || !it->second.handle ||
+            it->second.free_prepared) {
+            return false;
+        }
+        raw_offset = it->second.handle->address();
+        object_size = it->second.object_size;
+        key = it->second.key;
+    }
+    hash_key = ShardHashKey(shard_idx);
+    field = std::to_string(alloc_offset);
+#ifdef STORE_USE_REDIS
+    DfsAllocRecord rec{raw_offset, object_size, std::move(key)};
+    const auto serialized = struct_pack::serialize(rec);
+    value.assign(serialized.begin(), serialized.end());
+#else
+    (void)raw_offset;
+    (void)object_size;
+    value.clear();
+#endif
+    return true;
+}
+
+bool ShardAllocator::CommitAllocation(int shard_idx, uint64_t alloc_offset) {
+    if (!redis_enabled_) return true;
+    std::string hash_key;
+    std::string field;
+    std::string value;
+    if (!PrepareCommitRecord(shard_idx, alloc_offset, hash_key, field, value)) {
+        // The record disappeared under the shard lock; not a Redis failure.
+        return true;
+    }
+    return RedisPersistRecord(shard_idx, hash_key, field, value);
+}
+
+void ShardAllocator::UncommitAllocation(int shard_idx, uint64_t alloc_offset) {
+    RedisRemoveAlloc(shard_idx, alloc_offset);
+}
+
+bool ShardAllocator::RedisPersistRecord(int shard_idx,
+                                        const std::string& hash_key,
+                                        const std::string& field,
+                                        const std::string& value) {
+    if (!redis_enabled_) return true;
+#ifndef STORE_USE_REDIS
+    (void)shard_idx;
+    (void)hash_key;
+    (void)field;
+    (void)value;
+    return true;
+#else
+    RedisConn& conn = RedisConnForShard(shard_idx);
+    std::string owned_hash(hash_key);
+    std::string owned_field(field);
+    std::string owned_value(value);
+    return Submit(conn,
+                  [this, hash_key = std::move(owned_hash),
+                   field = std::move(owned_field),
+                   value = std::move(owned_value)](RedisConn& c) {
+                      return DoRedisPersistRecord(c, hash_key, field, value);
+                  });
+#endif
+}
+
+bool ShardAllocator::RedisRemoveAlloc(int shard_idx, uint64_t alloc_offset) {
+    if (!redis_enabled_) return true;
+#ifndef STORE_USE_REDIS
+    (void)shard_idx;
+    (void)alloc_offset;
+    return true;
+#else
+    std::string hash_key = ShardHashKey(shard_idx);
+    std::string field = std::to_string(alloc_offset);
+    RedisConn& conn = RedisConnForShard(shard_idx);
+    return Submit(conn, [this, hash_key = std::move(hash_key),
+                         field = std::move(field)](RedisConn& c) {
+        return DoRedisRemoveAlloc(c, hash_key, field);
+    });
+#endif
+}
+
+#ifdef STORE_USE_REDIS
+bool ShardAllocator::Submit(RedisConn& conn,
+                            std::function<bool(RedisConn&)> job) {
+    std::unique_lock<std::mutex> lock(conn.mutex);
+    conn.space_cv.wait(lock, [&conn] {
+        return conn.stopping || conn.queue.size() < RedisConn::kQueueLimit;
+    });
+    if (conn.stopping) return false;
+    conn.queue.push_back(RedisJob{std::move(job), std::promise<bool>()});
+    auto result = conn.queue.back().done.get_future();
+    conn.work_cv.notify_one();
+    lock.unlock();
+    return result.get();
+}
+
+void ShardAllocator::ActorLoop(RedisConn& conn) {
+    while (true) {
+        RedisJob job;
+        {
+            std::unique_lock<std::mutex> lock(conn.mutex);
+            conn.work_cv.wait(lock, [&conn] {
+                return conn.stopping || !conn.queue.empty();
+            });
+            if (conn.queue.empty()) {
+                if (conn.stopping) break;
+                continue;
+            }
+            job = std::move(conn.queue.front());
+            conn.queue.pop_front();
+            conn.space_cv.notify_one();
+        }
+        bool ok = false;
+        try {
+            if (job.run) ok = job.run(conn);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "DFS redis actor job threw: " << e.what();
+        } catch (...) {
+            LOG(ERROR) << "DFS redis actor job threw an unknown exception";
+        }
+        job.done.set_value(ok);
+    }
+}
+
+bool ShardAllocator::EnsureRedisConnected(RedisConn& conn) {
+    if (conn.ctx != nullptr) return true;
+    auto connection = ha::common::redis::ConnectRedis(redis_connstring_);
+    if (!connection) {
+        LOG(ERROR) << "DFS redis: connect failed";
+        return false;
+    }
+    conn.ctx = std::move(connection.value());
+    return true;
+}
+
+bool ShardAllocator::DoRedisPersistRecord(RedisConn& conn,
+                                         const std::string& hash_key,
+                                         const std::string& field,
+                                         const std::string& value) {
+    if (!EnsureRedisConnected(conn)) return false;
+    ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
+        redisCommand(conn.ctx.get(), "HSET %s %s %b", hash_key.c_str(),
+                     field.c_str(), value.data(), value.size())));
+    if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+        LOG(ERROR) << "DFS redis HSET failed, key=" << hash_key
+                   << " field=" << field
+                   << ", dropping connection for reconnect";
+        conn.ctx.reset();
+        return false;
+    }
+    return true;
+}
+
+bool ShardAllocator::DoRedisRemoveAlloc(RedisConn& conn,
+                                        const std::string& hash_key,
+                                        const std::string& field) {
+    if (!EnsureRedisConnected(conn)) return false;
+    ha::common::redis::RedisReplyPtr reply(static_cast<redisReply*>(
+        redisCommand(conn.ctx.get(), "HDEL %s %s", hash_key.c_str(),
+                     field.c_str())));
+    if (reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+        LOG(ERROR) << "DFS redis HDEL failed, key=" << hash_key
+                   << " field=" << field
+                   << ", dropping connection for reconnect";
+        conn.ctx.reset();
+        return false;
+    }
+    return true;
+}
+#endif
 
 uint64_t ShardAllocator::AlignSize(uint64_t size) const {
     return (size + alignment_ - 1) & ~(alignment_ - 1);

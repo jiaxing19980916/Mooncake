@@ -24,6 +24,14 @@ struct DistributedStorageConfig {
     std::chrono::seconds eviction_check_interval{5};
     std::string object_storage_config_path;
 
+    // Redis persistence of the shard allocator's offset_to_handle ledger.
+    // Empty connstring disables it; the master sets these only when
+    // MOONCAKE_ENABLE_REDIS_RECOVERY is on. redis_namespace is the cluster id.
+    std::string redis_connstring;
+    std::string redis_namespace;
+    int redis_pscan_shards = 0;
+    int redis_write_conns = 0;
+
     bool UsesObjectStorage() const {
         return fs_adapter_type == "oss" || fs_adapter_type == "s3" ||
                fs_adapter_type == "kvcs-lowlevel";

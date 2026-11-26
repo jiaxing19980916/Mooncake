@@ -332,6 +332,73 @@ bool MasterMetaRedisStore::DoPutObjects(
     return true;
 }
 
+bool MasterMetaRedisStore::PutObjectAndHashes(
+    size_t bucket, std::string_view tenant_id, std::string_view key,
+    std::string_view payload, const std::vector<HSetCmd>& extra) {
+    if (!Enabled()) return true;
+    ConnSlot& slot = SlotForBucket(bucket);
+    std::string owned_tenant(tenant_id);
+    std::string owned_key(key);
+    std::string owned_payload(payload);
+    std::vector<HSetCmd> owned_extra(extra);
+    return Submit(
+        slot,
+        [this, bucket, tenant = std::move(owned_tenant),
+         key = std::move(owned_key), payload = std::move(owned_payload),
+         extra = std::move(owned_extra)](ConnSlot& s) {
+            return DoPutObjectAndHashes(s, bucket, tenant, key, payload, extra);
+        });
+}
+
+bool MasterMetaRedisStore::DoPutObjectAndHashes(
+    ConnSlot& slot, size_t bucket, std::string_view tenant_id,
+    std::string_view key, std::string_view payload,
+    const std::vector<HSetCmd>& extra) {
+    if (!EnsureConnectedLocked(slot)) return false;
+    const std::string hash_key = ObjHashKey(bucket);
+    const std::string field = EncodeField(tenant_id, key);
+    // Ledger first, object last: a pipeline that dies midway leaves at most
+    // orphan oth records, never an object whose extents are missing.
+    size_t appended = 0;
+    bool ok = true;
+    for (const auto& cmd : extra) {
+        if (redisAppendCommand(slot.ctx.get(), "HSET %b %b %b",
+                               cmd.hash_key.data(), cmd.hash_key.size(),
+                               cmd.field.data(), cmd.field.size(),
+                               cmd.value.data(), cmd.value.size()) != REDIS_OK) {
+            ok = false;
+            break;
+        }
+        ++appended;
+    }
+    if (ok) {
+        if (redisAppendCommand(slot.ctx.get(), "HSET %b %b %b",
+                               hash_key.data(), hash_key.size(),
+                               field.data(), field.size(), payload.data(),
+                               payload.size()) == REDIS_OK) {
+            ++appended;
+        } else {
+            ok = false;
+        }
+    }
+    for (size_t i = 0; i < appended; ++i) {
+        redisReply* reply = nullptr;
+        if (redisGetReply(slot.ctx.get(), reinterpret_cast<void**>(&reply)) !=
+                REDIS_OK ||
+            reply == nullptr || reply->type == REDIS_REPLY_ERROR) {
+            ok = false;
+        }
+        if (reply != nullptr) freeReplyObject(reply);
+    }
+    if (!ok) {
+        LOG(ERROR) << "MetaRedis pipelined HSET failed, key=" << hash_key
+                   << ", extra=" << extra.size()
+                   << ", dropping connection for reconnect";
+        slot.ctx.reset();
+    }
+    return ok;
+}
+
 bool MasterMetaRedisStore::HDel(ConnSlot& slot, std::string_view hash_key,
                                 std::string_view field) {
     if (!EnsureConnectedLocked(slot)) return false;
@@ -426,6 +493,11 @@ bool MasterMetaRedisStore::PutObjects(
     return true;
 }
 
+bool MasterMetaRedisStore::PutObjectAndHashes(
+    size_t, std::string_view, std::string_view, std::string_view,
+    const std::vector<HSetCmd>&) {
+    return true;
+}
 
 bool MasterMetaRedisStore::PutSegment(const StandbySegmentInfo&) { return true; }
 
